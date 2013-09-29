@@ -29,8 +29,7 @@ type Notification struct {
 }
 
 type ListenerConn struct {
-	cn        *conn
-	closed    bool
+	cn *conn
 	err error
 
 	notificationChan chan<- Notification
@@ -50,7 +49,6 @@ func NewListenerConn(name string, notificationChan chan<- Notification) (*Listen
 
 	l := &ListenerConn{
 		cn: cn.(*conn),
-		closed: false,
 		notificationChan: notificationChan,
 		lock: new(sync.Mutex),
 		senderToken: make(chan bool, 1),
@@ -204,7 +202,6 @@ func (l *ListenerConn) Unlisten(relname string) error {
 }
 
 func (l *ListenerConn) Close() error {
-	l.closed = true
 	return l.cn.Close()
 }
 

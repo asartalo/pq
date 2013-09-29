@@ -36,6 +36,7 @@ type ListenerConn struct {
 
 	// guards only sending/closing of senderToken
 	lock      *sync.Mutex
+	// see acquireToken()
 	senderToken chan bool
 
 	replyChan chan message
@@ -62,6 +63,10 @@ func NewListenerConn(name string, notificationChan chan<- Notification) (*Listen
 	return l, nil
 }
 
+// acquireToken() attempts to grab the token a goroutine needs to be holding
+// to be allowed to send anything on the connection.  Waits until the token is
+// in the caller's possession, or returns false if the connection has been
+// closed and no further sends should be attempted.
 func (l *ListenerConn) acquireToken() bool {
 	token, ok := <-l.senderToken
 	if !ok {
@@ -77,10 +82,12 @@ func (l *ListenerConn) acquireToken() bool {
 
 func (l *ListenerConn) releaseToken() {
 	// If we lost the connection, the goroutine running listenerConnMain will
-	// have closed the channel, and we can not try and release the token; this
-	// is necessary because send on a closed channel would panic.  But it's not
-	// a huge problem since we need to serialize access to releaseToken()
-	// anyway (as there's only one token).
+	// have closed the channel.  As attempting to send on a closed channel
+	// panics in Go, we will not try and do that; instead, listenerConnMain
+	// sets the channel pointer to nil to let us know that the channel has been
+	// closed.  Obviously, we need be holding the mutex while checking for the
+	// channel's nil-ness, but that should not pose a problem as there's only
+	// one token anyway.
 	l.lock.Lock()
 	defer l.lock.Unlock()
 	if l.senderToken == nil {

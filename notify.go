@@ -136,7 +136,13 @@ func (l *ListenerConn) listenerConnMain() {
 			n := recvNotification(r)
 			l.notificationChan <- n
 		case 'Z', 'E':
-			l.replyChan <- message{t, r}
+			select {
+				case l.replyChan <- message{t, r}:
+
+				// sanity check
+				default:
+					panic("replyChan channel full")
+			}
 		case 'C':
 			// ignore
 		case 'T', 'N', 'S', 'D':

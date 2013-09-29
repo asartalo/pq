@@ -3,30 +3,11 @@
 package pq
 
 import (
-	"errors"
 	"fmt"
 	"io"
 	"strings"
 	"sync"
-	"time"
 )
-
-// Special bePid value issued on reconnection.
-const Reconnected int = -1
-
-// The minimum/initial back-off for reconnection.
-const MinReconnectDelay time.Duration = 3 * time.Second
-
-// The maximum back-off for reconnection.
-const MaxReconnectDelay time.Duration = 15 * time.Minute
-
-var errClosed = errors.New("listener closed")
-
-type Notification struct {
-	BePid   int
-	RelName string
-	Extra   string
-}
 
 func recvNotification(r *readBuf) Notification {
 	bePid := r.int32()
@@ -41,193 +22,165 @@ type message struct {
 	buf *readBuf
 }
 
-type Listener struct {
-	name      string
+type Notification struct {
+	BePid   int
+	RelName string
+	Extra   string
+}
+
+type ListenerConn struct {
 	cn        *conn
 	closed    bool
+	err error
+
+	notificationChan chan<- Notification
+
+	// guards only sending/closing of senderToken
 	lock      *sync.Mutex
-	channels  map[string]map[chan<- *Notification]bool
+	senderToken chan bool
+
 	replyChan chan message
 }
 
-func NewListener(name string) (*Listener, error) {
+func NewListenerConn(name string, notificationChan chan<- Notification) (*ListenerConn, error) {
 	cn, err := Open(name)
-
 	if err != nil {
 		return nil, err
 	}
 
-	l := &Listener{
-		name,
-		cn.(*conn),
-		false,
-		new(sync.Mutex),
-		make(map[string]map[chan<- *Notification]bool),
-		make(chan message)}
+	l := &ListenerConn{
+		cn: cn.(*conn),
+		closed: false,
+		notificationChan: notificationChan,
+		lock: new(sync.Mutex),
+		senderToken: make(chan bool, 1),
+		replyChan: make(chan message, 1),
+	}
+	// summon the token
+	l.releaseToken()
 
-	go l.listen()
+	go l.listenerConnMain()
 
 	return l, nil
 }
 
-func (l *Listener) recv2() (byte, *readBuf, error) {
-	x := make([]byte, 5)
-	_, err := io.ReadFull(l.cn.buf, x)
-	if err != nil {
-		if l.closed {
-			// Listener.Close() called.
-			return 0, nil, errClosed
-		}
-
-		return 0, nil, err
+func (l *ListenerConn) acquireToken() bool {
+	token, ok := <-l.senderToken
+	if !ok {
+		return false
 	}
 
-	b := readBuf(x[1:])
-	y := make([]byte, b.int32()-4)
-	_, err = io.ReadFull(l.cn.buf, y)
-	if err != nil {
-		if l.closed {
-			// Listener.Close() called.
-			return 0, nil, errClosed
-		}
-
-		return x[0], nil, err
+	// sanity check
+	if !token {
+		panic("false token")
 	}
-
-	return x[0], (*readBuf)(&y), err
+	return token
 }
 
-func (l *Listener) listen() {
+func (l *ListenerConn) releaseToken() {
+	// If we lost the connection, the goroutine running listenerConnMain will
+	// have closed the channel, and we can not try and release the token; this
+	// is necessary because send on a closed channel would panic.  But it's not
+	// a huge problem since we need to serialize access to releaseToken()
+	// anyway (as there's only one token).
+	l.lock.Lock()
+	defer l.lock.Unlock()
+	if l.senderToken == nil {
+		return
+	}
+
+	select {
+		case l.senderToken <- true:
+
+		// sanity check
+		default:
+			panic("senderToken channel full")
+	}
+}
+
+func (l *ListenerConn) recv() (typ byte, buf *readBuf, err error) {
+	typ, buf, err = l.cn.recvMessage()
+	if err != nil {
+		return
+	}
+
+	return
+}
+
+func (l *ListenerConn) listenerConnMain() {
 	for {
-		t, r, err := l.recv2()
-
+		t, r, err := l.recv()
 		if err != nil {
-			if err == io.EOF || err == io.ErrUnexpectedEOF {
-				l.cn = reconnect(l.name)
-				err = l.relisten()
+			// Make sure nobody tries to start any new queries.  We can't
+			// simply close senderToken or acquireToken() would panic; see
+			// comments near the beginning of that function.
+			l.lock.Lock()
+			close(l.senderToken)
+			l.senderToken = nil
+			l.lock.Unlock()
 
-				if err != nil {
-					// Just reconnect if LISTEN fails.
-					continue
-				}
+			// There might be a query in-flight; make sure nobody's waiting for a
+			// response to it, since there's not going to be one.
+			close(l.replyChan)
 
-				// Notify everyone that we have reconnected.
-				for relname, chans := range l.channels {
-					for ch := range chans {
-						ch <- &Notification{Reconnected, relname, ""}
-					}
-				}
+			// let the listener know we're done
+			l.err = err
+			close(l.notificationChan)
 
-				continue
-			} else if err == errClosed {
-				return
-			} else {
-				panic(err)
-			}
+			// this ListenerConn is done
+			return
 		}
 
 		switch t {
 		case 'A':
 			n := recvNotification(r)
-			l.dispatch(&n)
-		default:
+			l.notificationChan <- n
+		case 'Z', 'E':
 			l.replyChan <- message{t, r}
+		case 'C':
+			// ignore
+		case 'T', 'N', 'S', 'D':
+			// ignore
+		default:
+			errorf("unknown response for simple query: %q", t)
 		}
 	}
 }
 
-func (l *Listener) relisten() error {
-	for relname := range l.channels {
-		_, err := l.cn.simpleQuery("LISTEN " + quoteRelname(relname))
-		if err != nil {
-			return err
-		}
+func (l *ListenerConn) Listen(relname string) error {
+	if !l.acquireToken() {
+		return io.EOF
 	}
+	defer l.releaseToken()
 
-	return nil
-}
-
-func reconnect(name string) *conn {
-	delay := MinReconnectDelay
-
-	for {
-		cn, err := Open(name)
-
-		if err == nil {
-			return cn.(*conn)
-		}
-
-		time.Sleep(delay)
-		delay *= 2
-
-		if delay > MaxReconnectDelay {
-			delay = MaxReconnectDelay
-		}
-	}
-
-	panic("not reached")
-}
-
-func (l *Listener) dispatch(n *Notification) {
-	data, ok := l.channels[n.RelName]
-
-	if ok {
-		for ch := range data {
-			ch <- n
-		}
-	}
-}
-
-func (l *Listener) Close() error {
-	l.closed = true
-
-	return l.cn.Close()
-}
-
-func (l *Listener) Listen(relname string, c chan<- *Notification) error {
-	l.lock.Lock()
-	defer l.lock.Unlock()
-
-	data, ok := l.channels[relname]
-
-	if !ok {
-		data = make(map[chan<- *Notification]bool, 1)
-		l.channels[relname] = data
-	}
-
-	data[c] = true
-
-	if len(data) == 1 {
-		return l.simpleQuery2("LISTEN " + quoteRelname(relname))
-	}
-
-	return nil
+	return l.execSimpleQuery("LISTEN " + quoteRelname(relname))
 }
 
 func quoteRelname(relname string) string {
 	return fmt.Sprintf(`"%s"`, strings.Replace(relname, `"`, `""`, -1))
 }
 
-func (l *Listener) simpleQuery2(q string) (err error) {
+func (l *ListenerConn) execSimpleQuery(q string) (err error) {
 	defer errRecover(&err)
 
-	b := newWriteBuf('Q')
+	b := l.cn.writeBuf('Q')
 	b.string(q)
 	l.cn.send(b)
 
 	for {
-		m := <-l.replyChan
+		m, ok := <-l.replyChan
+		if !ok {
+			// We lost the connection to server, don't bother waiting for a
+			// a response.
+			return io.EOF
+		}
 		t, r := m.typ, m.buf
 		switch t {
-		case 'C':
-			// ignore
 		case 'Z':
 			// done
-			return
+			return nil
 		case 'E':
-			err = parseError(r)
-		case 'T', 'N', 'S', 'D':
-			// ignore
+			return parseError(r)
 		default:
 			errorf("unknown response for simple query: %q", t)
 		}
@@ -235,27 +188,16 @@ func (l *Listener) simpleQuery2(q string) (err error) {
 	panic("not reached")
 }
 
-func (l *Listener) Unlisten(relname string, c chan<- *Notification) error {
-	l.lock.Lock()
-	defer l.lock.Unlock()
-
-	data, ok := l.channels[relname]
-
-	if !ok {
-		return nil
+func (l *ListenerConn) Unlisten(relname string) error {
+	if !l.acquireToken() {
+		return io.EOF
 	}
+	defer l.releaseToken()
 
-	delete(data, c)
+	return l.execSimpleQuery("UNLISTEN " + quoteRelname(relname))
+}
 
-	if len(data) == 0 {
-		err := l.simpleQuery2("UNLISTEN " + quoteRelname(relname))
-
-		if err != nil {
-			return err
-		}
-
-		delete(l.channels, relname)
-	}
-
-	return nil
+func (l *ListenerConn) Close() error {
+	l.closed = true
+	return l.cn.Close()
 }

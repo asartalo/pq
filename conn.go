@@ -451,13 +451,13 @@ func (cn *conn) recv() (t byte, r *readBuf) {
 	panic("not reached")
 }
 
-func (cn *conn) recv1() (byte, *readBuf) {
+func (cn *conn) recvMessage() (typ byte, buf *readBuf, err error) {
 	x := cn.scratch[:5]
-	_, err := io.ReadFull(cn.buf, x)
+	_, err = io.ReadFull(cn.buf, x)
 	if err != nil {
-		panic(err)
+		return
 	}
-	c := x[0]
+	typ = x[0]
 
 	b := readBuf(x[1:])
 	n := b.int32() - 4
@@ -469,10 +469,18 @@ func (cn *conn) recv1() (byte, *readBuf) {
 	}
 	_, err = io.ReadFull(cn.buf, y)
 	if err != nil {
-		panic(err)
+		return
 	}
 
-	return c, (*readBuf)(&y)
+	return typ, (*readBuf)(&y), nil
+}
+
+func (cn *conn) recv1() (byte, *readBuf) {
+	typ, buf, err := cn.recvMessage()
+	if err != nil {
+		panic(err)
+	}
+	return typ, buf
 }
 
 func (cn *conn) ssl(o Values) {

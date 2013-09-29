@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-func newTestListener(t *testing.T) *Listener {
+func newTestListenerConn(t *testing.T) (*ListenerConn, <-chan Notification) {
 	datname := os.Getenv("PGDATABASE")
 	sslmode := os.Getenv("PGSSLMODE")
 
@@ -18,38 +18,36 @@ func newTestListener(t *testing.T) *Listener {
 		os.Setenv("PGSSLMODE", "disable")
 	}
 
-	l, err := NewListener("")
+	notificationChan := make(chan Notification)
+	l, err := NewListenerConn("", notificationChan)
 
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	return l
+	return l, notificationChan
 }
 
-func TestNewListener(t *testing.T) {
-	l := newTestListener(t)
+func TestNewListenerConn(t *testing.T) {
+	l, _ := newTestListenerConn(t)
 
 	defer l.Close()
 }
 
 func TestListen(t *testing.T) {
-	channel := make(chan *Notification)
-	l := newTestListener(t)
+	l, channel := newTestListenerConn(t)
 
 	defer l.Close()
 
 	db := openTestConn(t)
 	defer db.Close()
 
-	err := l.Listen("notify_test", channel)
-
+	err := l.Listen("notify_test")
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	_, err = db.Exec("NOTIFY notify_test")
-
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,65 +60,51 @@ func TestListen(t *testing.T) {
 }
 
 func TestUnlisten(t *testing.T) {
-	channel := make(chan *Notification)
-	l := newTestListener(t)
+	l, channel := newTestListenerConn(t)
 
 	defer l.Close()
 
 	db := openTestConn(t)
 	defer db.Close()
 
-	err := l.Listen("notify_test", channel)
-
+	err := l.Listen("notify_test")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	l.Unlisten("notify_test", channel)
+	l.Unlisten("notify_test")
 
 	_, err = db.Exec("NOTIFY notify_test")
-
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	timeout := make(chan bool, 1)
-	go func() {
-		time.Sleep(500 * time.Millisecond)
-		timeout <- true
-	}()
 
 	select {
 	case <-channel:
 		t.Fatal("Got notification after Unlisten")
-
-	case <-timeout:
+	case <-time.After(500 * time.Millisecond):
 	}
 }
 
 func TestNotifyExtra(t *testing.T) {
-	channel := make(chan *Notification)
-	l := newTestListener(t)
+	l, channel := newTestListenerConn(t)
 
 	defer l.Close()
 
 	db := openTestConn(t)
 	defer db.Close()
 
-	err := l.Listen("notify_test", channel)
-
+	err := l.Listen("notify_test")
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	_, err = db.Exec("NOTIFY notify_test, 'something'")
-
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	n := <-channel
-
 	if n.Extra != "something" {
 		t.Errorf("Notification extra invalid: %v", n.Extra)
 	}

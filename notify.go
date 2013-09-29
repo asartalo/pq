@@ -201,3 +201,9 @@ func (l *ListenerConn) Close() error {
 	l.closed = true
 	return l.cn.Close()
 }
+
+// Err() returns the reason the connection was closed.  You shouldn't call this
+// function until l.notificationChan has been closed.
+func (l *ListenerConn) Err() error {
+	return l.err
+}

@@ -376,6 +376,8 @@ func (l *Listener) listenRequestWorkerMain() {
 					panic(err)
 				}
 
+				//TODO: send a faux notification here
+
 			case shouldDie := <-l.listenRequestWorkerSignaler:
 				if !shouldDie {
 					panic("shouldDie == false")

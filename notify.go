@@ -3,11 +3,15 @@
 package pq
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"strings"
 	"sync"
+	"time"
 )
+
+var ErrBufferFull = errors.New("listener: buffer full")
 
 func recvNotification(r *readBuf) Notification {
 	bePid := r.int32()
@@ -35,7 +39,7 @@ type ListenerConn struct {
 	notificationChan chan<- Notification
 
 	// guards only sending/closing of senderToken
-	lock      *sync.Mutex
+	lock sync.Mutex
 	// see acquireToken()
 	senderToken chan bool
 
@@ -51,7 +55,7 @@ func NewListenerConn(name string, notificationChan chan<- Notification) (*Listen
 	l := &ListenerConn{
 		cn: cn.(*conn),
 		notificationChan: notificationChan,
-		lock: new(sync.Mutex),
+		lock: sync.Mutex{},
 		senderToken: make(chan bool, 1),
 		replyChan: make(chan message, 1),
 	}
@@ -217,3 +221,225 @@ func (l *ListenerConn) Close() error {
 func (l *ListenerConn) Err() error {
 	return l.err
 }
+
+type listenRequest struct {
+	relname string
+	unlisten bool
+}
+
+type Listener struct {
+	name string
+	closed bool
+	cn *ListenerConn
+	notificationChan <-chan Notification
+
+	listenRequestChan chan listenRequest
+	listenRequestWorkerSignaler chan bool
+	listenRequestWorkerWG sync.WaitGroup
+
+	lock sync.Mutex
+	channels map[string] map[chan<- Notification] bool
+}
+
+func NewListener(name string) (*Listener, error) {
+	l := &Listener{
+		name: name,
+		closed: false,
+		cn: nil,
+		notificationChan: nil,
+		listenRequestChan: nil,
+		listenRequestWorkerSignaler: nil,
+		lock: sync.Mutex{},
+		channels: make(map[string] map[chan<- Notification] bool),
+	}
+
+	go l.listenerMain()
+
+	return l, nil
+}
+
+func (l *Listener) requestListen(relname string, unlisten bool) error {
+	request := listenRequest{
+		relname: relname,
+		unlisten: unlisten,
+	}
+	select {
+		case l.listenRequestChan <-request:
+			return nil
+		default:
+			return ErrBufferFull
+	}
+}
+
+func (l *Listener) Listen(relname string, c chan<- Notification) error {
+    l.lock.Lock()
+	defer l.lock.Unlock()
+
+    data, ok := l.channels[relname]
+    if ok {
+		// the connection is already listening on this channel, we're done
+        data[c] = true
+		if l.cn == nil {
+			// .. or would be, if there was a connection.  In this case we
+			// simply add the channel to the list of listeners for this
+			// channel, and immediately send a faux notification indicating
+			// that the connection is down.
+
+			// TODO
+		}
+        return nil
+    }
+
+    data = make(map[chan<- Notification] bool, 1)
+    l.channels[relname] = data
+	data[c] = true
+
+	if l.cn == nil {
+		// TODO something similar to the above
+		return nil
+	}
+
+	err := l.requestListen(relname, false)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (l *Listener) disconnectCleanup() {
+	l.killListenRequestWorker()
+	l.listenRequestWorkerWG.Wait()
+
+	l.lock.Lock()
+	close(l.listenRequestChan)
+	l.listenRequestChan = nil
+	close(l.listenRequestWorkerSignaler)
+	l.listenRequestWorkerSignaler = nil
+	l.lock.Unlock()
+}
+
+func (l *Listener) connect() {
+	var cn *ListenerConn
+	var err error
+
+	notificationChan := make(chan Notification, 32)
+	for {
+		cn, err = NewListenerConn(l.name, notificationChan)
+		if err == nil {
+			break
+		}
+
+		// XXX
+		//time.Sleep(5 * time.Second)
+		time.Sleep(1 * time.Millisecond)
+	}
+
+	l.lock.Lock()
+	l.startListenRequestWorker()
+	l.cn = cn
+	l.notificationChan = notificationChan
+	l.lock.Unlock()
+}
+
+// caller must be holding l.lock
+func (l *Listener) startListenRequestWorker() {
+	l.listenRequestWorkerWG = sync.WaitGroup{}
+	l.listenRequestWorkerWG.Add(1)
+	l.listenRequestChan = make(chan listenRequest, 32)
+	l.listenRequestWorkerSignaler = make(chan bool, 1)
+
+	go l.listenRequestWorkerMain()
+}
+
+func (l *Listener) killListenRequestWorker() {
+	select {
+		case l.listenRequestWorkerSignaler <- true:
+
+		// sanity check
+		default:
+			panic("listenRequestWorkerSignaler channel full")
+	}
+}
+
+func (l *Listener) listenRequestWorkerMain() {
+	for {
+		select {
+			case request := <-l.listenRequestChan:
+				var err error
+				if !request.unlisten {
+					err = l.cn.Listen(request.relname)
+				} else {
+					err = l.cn.Unlisten(request.relname)
+				}
+				if err != nil {
+					panic(err)
+				}
+
+			case shouldDie := <-l.listenRequestWorkerSignaler:
+				if !shouldDie {
+					panic("shouldDie == false")
+				}
+				goto die
+		}
+	}
+die:
+	l.listenRequestWorkerWG.Done()
+}
+
+func (l *Listener) Close() {
+	l.closed = true
+}
+
+// caller should be holding l.lock
+func (l *Listener) removeChannel(ch chan<- Notification) {
+	for m := range l.channels {
+		delete(l.channels[m], ch)
+	}
+}
+
+func (l *Listener) dispatch(n Notification) {
+	l.lock.Lock()
+	defer l.lock.Unlock()
+
+	m, ok := l.channels[n.RelName]
+	if !ok {
+		// could happen
+		return
+	}
+
+	for ch := range m {
+		//panic(fmt.Sprintf("%#v", ch))
+		select {
+			case ch <- n:
+
+			default:
+				// glock the channel
+				close(ch)
+				l.removeChannel(ch)
+		}
+	}
+}
+
+func (l *Listener) listenerMain() {
+	for {
+		l.connect()
+
+		for {
+			notification, ok := <-l.notificationChan
+			if !ok {
+				// lost connection, loop again
+				break
+			}
+			l.dispatch(notification)
+		}
+
+		if l.closed {
+			return
+		}
+
+		l.disconnectCleanup()
+	}
+}
+
+

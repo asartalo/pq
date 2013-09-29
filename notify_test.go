@@ -20,7 +20,6 @@ func newTestListenerConn(t *testing.T) (*ListenerConn, <-chan Notification) {
 
 	notificationChan := make(chan Notification)
 	l, err := NewListenerConn("", notificationChan)
-
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -34,7 +33,7 @@ func TestNewListenerConn(t *testing.T) {
 	defer l.Close()
 }
 
-func TestListen(t *testing.T) {
+func TestConnListen(t *testing.T) {
 	l, channel := newTestListenerConn(t)
 
 	defer l.Close()
@@ -59,7 +58,7 @@ func TestListen(t *testing.T) {
 	}
 }
 
-func TestUnlisten(t *testing.T) {
+func TestConnUnlisten(t *testing.T) {
 	l, channel := newTestListenerConn(t)
 
 	defer l.Close()
@@ -109,3 +108,58 @@ func TestNotifyExtra(t *testing.T) {
 		t.Errorf("Notification extra invalid: %v", n.Extra)
 	}
 }
+
+func newTestListener(t *testing.T) (*Listener) {
+	datname := os.Getenv("PGDATABASE")
+	sslmode := os.Getenv("PGSSLMODE")
+
+	if datname == "" {
+		os.Setenv("PGDATABASE", "pqgotest")
+	}
+
+	if sslmode == "" {
+		os.Setenv("PGSSLMODE", "disable")
+	}
+
+	l, err := NewListener("")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return l
+}
+
+
+func TestListenerListen(t *testing.T) {
+	var n Notification
+
+	l := newTestListener(t)
+	defer l.Close()
+
+	db := openTestConn(t)
+	defer db.Close()
+
+	channel := make(chan Notification, 2)
+	time.Sleep(3 * time.Second)
+	err := l.Listen("notify_test", channel)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = db.Exec("NOTIFY notify_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+		case n = <-channel:
+
+		case <-time.After(5 * time.Second):
+			panic("timeout")
+	}
+
+	if n.RelName != "notify_test" {
+		t.Errorf("Notification RelName invalid: %v", n.RelName)
+	}
+}
+

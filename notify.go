@@ -272,13 +272,13 @@ func (l *Listener) requestListen(relname string, unlisten bool) error {
 }
 
 func (l *Listener) Listen(relname string, c chan<- Notification) error {
-    l.lock.Lock()
+	l.lock.Lock()
 	defer l.lock.Unlock()
 
-    data, ok := l.channels[relname]
-    if ok {
+	data, ok := l.channels[relname]
+	if ok {
 		// the connection is already listening on this channel, we're done
-        data[c] = true
+		data[c] = true
 		if l.cn == nil {
 			// .. or would be, if there was a connection.  In this case we
 			// simply add the channel to the list of listeners for this
@@ -287,11 +287,11 @@ func (l *Listener) Listen(relname string, c chan<- Notification) error {
 
 			// TODO
 		}
-        return nil
-    }
+		return nil
+	}
 
-    data = make(map[chan<- Notification] bool, 1)
-    l.channels[relname] = data
+	data = make(map[chan<- Notification] bool, 1)
+	l.channels[relname] = data
 	data[c] = true
 
 	if l.cn == nil {

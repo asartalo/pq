@@ -138,9 +138,11 @@ func (l *ListenerConn) listenerConnMain() {
 
 		switch t {
 		case 'A':
+			// notification
 			n := recvNotification(r)
 			l.notificationChan <- n
 		case 'Z', 'E':
+			// reply to a query
 			select {
 				case l.replyChan <- message{t, r}:
 
@@ -148,9 +150,7 @@ func (l *ListenerConn) listenerConnMain() {
 				default:
 					panic("replyChan channel full")
 			}
-		case 'C':
-			// ignore
-		case 'T', 'N', 'S', 'D':
+		case 'C', 'T', 'N', 'S', 'D':
 			// ignore
 		default:
 			errorf("unknown response for simple query: %q", t)

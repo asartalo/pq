@@ -269,16 +269,16 @@ func NewListener(name string) (*Listener, error) {
 	return l, nil
 }
 
-func (l *Listener) requestListen(relname string, unlisten bool) error {
+func (l *Listener) requestListen(relname string, unlisten bool) bool {
 	request := listenRequest{
 		relname: relname,
 		unlisten: unlisten,
 	}
 	select {
 		case l.listenRequestChan <-request:
-			return nil
+			return true
 		default:
-			return ErrBufferFull
+			return false
 	}
 }
 
@@ -320,9 +320,8 @@ func (l *Listener) Listen(relname string, c chan<- Notification) (bool, error) {
 		return false, nil
 	}
 
-	err := l.requestListen(relname, false)
-	if err != nil {
-		return false, err
+	if !l.requestListen(relname, false) {
+		return false, ErrBufferFull
 	}
 
 	return false, nil
@@ -340,14 +339,10 @@ func (l *Listener) Unlisten(relname string, c chan<- Notification) error {
 
 	delete(data, c)
 	if len(data) == 0 {
-		// no empty maps in channels
-		delete(l.channels, relname)
-
 		// Request the channel to be UNLISTENed.  ErrBufferFull is not a
 		// problem here; we'll just do it later.
-		err := l.requestListen(relname, true)
-		if err != nil && err != ErrBufferFull {
-			return err
+		if l.requestListen(relname, true) {
+			delete(l.channels, relname)
 		}
 	}
 	return nil
@@ -509,18 +504,18 @@ func (l *Listener) dispatch(n Notification) {
 
 	m, ok := l.channels[n.RelName]
 	if !ok {
-		// no listeners, try and UNLISTEN
-		err := l.requestListen(n.RelName, true)
-		if err != nil && err != ErrBufferFull {
-			// shouldn't happen
-			panic(err)
-		}
+		// a NOTIFY was queued for a channel we've (or are about to) issue an
+		// UNLISTEN for; no problem
 		return
 	}
 
 	// sanity check; no empty maps should appear in channels
 	if len(m) == 0 {
-		panic("len(m) == 0")
+		// no listeners, try and UNLISTEN
+		if l.requestListen(n.RelName, true) {
+			delete(l.channels, n.RelName)
+		}
+		return
 	}
 
 	for _, lnc := range m {

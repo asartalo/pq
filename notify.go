@@ -563,6 +563,14 @@ func (l *Listener) dispatch(n Notification) {
 	}
 }
 
+// XXX remove?
+func (l *Listener) ListenChannels() int {
+	l.lock.Lock()
+	defer l.lock.Unlock()
+
+	return len(l.channels)
+}
+
 func (l *Listener) listenerMain() {
 	for {
 		if !l.connect() {

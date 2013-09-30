@@ -61,7 +61,7 @@ func NewListenerConn(name string, notificationChan chan<- Notification) (*Listen
 		notificationChan: notificationChan,
 		lock: sync.Mutex{},
 		senderToken: make(chan bool, 1),
-		replyChan: make(chan message, 1),
+		replyChan: make(chan message, 2),
 	}
 	// summon the token
 	l.releaseToken()
@@ -140,21 +140,19 @@ func (l *ListenerConn) listenerConnMain() {
 			// notification
 			n := recvNotification(r)
 			l.notificationChan <- n
-		case 'Z', 'E':
+		case 'C', 'E', 'Z':
 			// reply to a query
-			select {
-				case l.replyChan <- message{t, r}:
-
-				// sanity check
-				default:
-					panic("replyChan channel full")
-			}
-		case 'C', 'T', 'N', 'S', 'D':
+			l.replyChan <- message{t, r}
+		case 'T', 'N', 'S', 'D':
 			// ignore
 		default:
 			errorf("unknown response for simple query: %q", t)
 		}
 	}
+}
+
+func quoteRelname(relname string) string {
+	return fmt.Sprintf(`"%s"`, strings.Replace(relname, `"`, `""`, -1))
 }
 
 func (l *ListenerConn) Listen(relname string) error {
@@ -166,17 +164,35 @@ func (l *ListenerConn) Listen(relname string) error {
 	return l.execSimpleQuery("LISTEN " + quoteRelname(relname))
 }
 
-func quoteRelname(relname string) string {
-	return fmt.Sprintf(`"%s"`, strings.Replace(relname, `"`, `""`, -1))
+func (l *ListenerConn) Unlisten(relname string) error {
+	if !l.acquireToken() {
+		return io.EOF
+	}
+	defer l.releaseToken()
+
+	return l.execSimpleQuery("UNLISTEN " + quoteRelname(relname))
 }
 
-func (l *ListenerConn) execSimpleQuery(q string) (err error) {
+func (l *ListenerConn) sendSimpleQuery(q string) (err error) {
 	defer errRecover(&err)
 
 	data := writeBuf([]byte("Q\x00\x00\x00\x00"))
 	b := &data
 	b.string(q)
 	l.cn.send(b)
+
+	return nil
+}
+
+func (l *ListenerConn) execSimpleQuery(q string) error {
+	var done bool = false
+
+	err := l.sendSimpleQuery(q)
+	if err != nil {
+		// We can't know what state the protocol is in, so we need to abandon
+		// this connection.
+		goto fail
+	}
 
 	for {
 		m, ok := <-l.replyChan
@@ -188,24 +204,29 @@ func (l *ListenerConn) execSimpleQuery(q string) (err error) {
 		t, r := m.typ, m.buf
 		switch t {
 		case 'Z':
+			if !done {
+				err = fmt.Errorf("unexpected ReadyForQuery")
+				goto fail
+			}
 			// done
-			return nil
+			return err
 		case 'E':
-			return parseError(r)
+			err = parseError(r)
+			fallthrough
+		case 'C':
+			if done {
+				err = fmt.Errorf("unexpected E/C")
+				goto fail
+			}
+			done = true
 		default:
 			errorf("unknown response for simple query: %q", t)
 		}
 	}
-	panic("not reached")
-}
 
-func (l *ListenerConn) Unlisten(relname string) error {
-	if !l.acquireToken() {
-		return io.EOF
-	}
-	defer l.releaseToken()
-
-	return l.execSimpleQuery("UNLISTEN " + quoteRelname(relname))
+fail:
+	l.cn.Close()
+	return err
 }
 
 func (l *ListenerConn) Close() error {
@@ -334,6 +355,13 @@ func (l *Listener) Unlisten(relname string, c chan<- Notification) error {
 	l.lock.Lock()
 	defer l.lock.Unlock()
 
+	// sanity check
+	_, ok := l.listenClients[c]
+	if !ok {
+		panic("missing entry")
+	}
+	delete(l.listenClients, c)
+
 	channel, ok := l.channels[relname]
 	if !ok {
 		// already gone, nothing to do
@@ -367,10 +395,6 @@ func (l *Listener) broadcast(pid int) {
 		BePid: pid,
 	}
 	for _, lnc := range l.listenClients {
-		if lnc.ch == nil {
-			continue
-		}
-
 		select {
 			case lnc.ch <- n:
 
@@ -397,7 +421,10 @@ func (l *Listener) resync(cn *ListenerConn, notificationChan <-chan Notification
 		// Ignore notifications while the synchronization is going on to avoid
 		// deadlocks; we'll broadcast a Reconnect for every channel anyway.
 		select {
-			case _ = <-notificationChan:
+			case _, ok := <-notificationChan:
+				if !ok {
+					notificationChan = nil
+				}
 
 			case err, ok := <-doneChan:
 				if ok {
@@ -481,9 +508,15 @@ func (l *Listener) listenRequestWorkerMain() {
 				} else {
 					err = l.cn.Unlisten(request.relname)
 				}
-				//TODO
+				// no way to recover; close the connection and try again
 				if err != nil {
-					panic(err)
+					// shouldn't need to lock here, I think, but doesn't hurt
+					l.lock.Lock()
+					if l.cn != nil {
+						l.cn.Close()
+					}
+					l.lock.Unlock()
+					goto die
 				}
 
 				n := Notification{
@@ -513,6 +546,7 @@ func (l *Listener) Close() {
 	l.closed = true
 }
 
+// caller must be holding l.lock
 func (l *Listener) removeListenClient(lnc *listenClient) {
 	for relname := range(lnc.relnames) {
 		// sanity check
@@ -523,6 +557,11 @@ func (l *Listener) removeListenClient(lnc *listenClient) {
 		delete(l.channels[relname].clients, lnc.ch)
 	}
 	lnc.relnames = nil
+	// sanity check
+	_, ok := l.listenClients[lnc.ch]
+	if !ok {
+		panic("missing entry")
+	}
 	delete(l.listenClients, lnc.ch)
 	close(lnc.ch)
 	lnc.ch = nil

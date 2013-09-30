@@ -140,25 +140,39 @@ func TestListenerListen(t *testing.T) {
 	defer db.Close()
 
 	channel := make(chan Notification, 2)
-	time.Sleep(3 * time.Second)
-	err := l.Listen("notify_test", channel)
+	connected, err := l.Listen("notify_listen_test", channel)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	_, err = db.Exec("NOTIFY notify_test")
+	if !connected {
+		select {
+			case n = <-channel:
+				if n.BePid != ListenerPidReconnect {
+					t.Errorf("expected ListenerPidReconnect, got %d", n.BePid)
+				}
+
+			case <-time.After(5 * time.Second):
+				panic("timeout")
+		}
+	}
+
+	_, err = db.Exec("NOTIFY notify_listen_test")
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	select {
 		case n = <-channel:
+			if n.BePid < 0 {
+				t.Errorf("unexpected BePid %d", n.BePid)
+			}
 
 		case <-time.After(5 * time.Second):
 			panic("timeout")
 	}
 
-	if n.RelName != "notify_test" {
+	if n.RelName != "notify_listen_test" {
 		t.Errorf("Notification RelName invalid: %v", n.RelName)
 	}
 }

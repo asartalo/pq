@@ -26,6 +26,10 @@ type message struct {
 	buf *readBuf
 }
 
+const ListenerPidOpen = -100
+const ListenerPidDisconnect = -101
+const ListenerPidReconnect = -102
+
 type Notification struct {
 	BePid   int
 	RelName string
@@ -227,6 +231,11 @@ type listenRequest struct {
 	unlisten bool
 }
 
+type listenClient struct {
+	ch chan<- Notification
+	relnames map[string] bool
+}
+
 type Listener struct {
 	name string
 	closed bool
@@ -238,7 +247,8 @@ type Listener struct {
 	listenRequestWorkerWG sync.WaitGroup
 
 	lock sync.Mutex
-	channels map[string] map[chan<- Notification] bool
+	listenClients map[chan<- Notification] *listenClient
+	channels map[string] map[chan<- Notification] *listenClient
 }
 
 func NewListener(name string) (*Listener, error) {
@@ -250,7 +260,8 @@ func NewListener(name string) (*Listener, error) {
 		listenRequestChan: nil,
 		listenRequestWorkerSignaler: nil,
 		lock: sync.Mutex{},
-		channels: make(map[string] map[chan<- Notification] bool),
+		listenClients: make(map[chan<- Notification] *listenClient),
+		channels: make(map[string] map[chan<- Notification] *listenClient),
 	}
 
 	go l.listenerMain()
@@ -271,39 +282,74 @@ func (l *Listener) requestListen(relname string, unlisten bool) error {
 	}
 }
 
-func (l *Listener) Listen(relname string, c chan<- Notification) error {
+func (l *Listener) Listen(relname string, c chan<- Notification) (bool, error) {
 	l.lock.Lock()
 	defer l.lock.Unlock()
+
+	lnc, ok := l.listenClients[c]
+	if !ok {
+		lnc = &listenClient{
+			ch: c,
+			relnames: make(map[string] bool, 1),
+		}
+		l.listenClients[c] = lnc
+	}
+	if lnc.ch == nil {
+		lnc.ch = c
+	}
+	lnc.relnames[relname] = true
 
 	data, ok := l.channels[relname]
 	if ok {
 		// the connection is already listening on this channel, we're done
-		data[c] = true
+		data[c] = lnc
 		if l.cn == nil {
 			// .. or would be, if there was a connection.  In this case we
-			// simply add the channel to the list of listeners for this
-			// channel, and immediately send a faux notification indicating
-			// that the connection is down.
-
-			// TODO
+			// return false, and the caller will have to wait for the
+			// connection to be re-established.
+			return false, nil
 		}
-		return nil
+		return true, nil
 	}
 
-	data = make(map[chan<- Notification] bool, 1)
+	data = make(map[chan<- Notification] *listenClient, 1)
+	data[c] = lnc
 	l.channels[relname] = data
-	data[c] = true
 
 	if l.cn == nil {
-		// TODO something similar to the above
-		return nil
+		return false, nil
 	}
 
 	err := l.requestListen(relname, false)
 	if err != nil {
-		return err
+		return false, err
 	}
 
+	return false, nil
+}
+
+func (l *Listener) Unlisten(relname string, c chan<- Notification) error {
+	l.lock.Lock()
+	defer l.lock.Unlock()
+
+	data, ok := l.channels[relname]
+	if !ok {
+		// already gone, nothing to do
+		return nil
+	}
+
+	delete(data, c)
+	if len(data) == 0 {
+		// no empty maps in channels
+		delete(l.channels, relname)
+
+		// Request the channel to be UNLISTENed.  ErrBufferFull is not a
+		// problem here; we'll just do it later.
+		err := l.requestListen(relname, true)
+		if err != nil && err != ErrBufferFull {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -319,26 +365,84 @@ func (l *Listener) disconnectCleanup() {
 	l.lock.Unlock()
 }
 
+// caller must be holding l.lock
+func (l *Listener) broadcast(pid int) {
+	n := Notification{
+		BePid: pid,
+	}
+	for _, lnc := range l.listenClients {
+		if lnc.ch == nil {
+			continue
+		}
+
+		select {
+			case lnc.ch <- n:
+			default:
+				close(lnc.ch)
+				lnc.ch = nil
+		}
+	}
+}
+
+func (l *Listener) resync(cn *ListenerConn, notificationChan <-chan Notification) error {
+	doneChan := make(chan error)
+	go func() {
+		for relname := range l.channels {
+			err := cn.Listen(relname)
+			if err != nil {
+				doneChan <- err
+				return
+			}
+		}
+		close(doneChan)
+	}()
+
+	for {
+		// Ignore notifications to avoid deadlocks; we'll broadcast a Reconnect
+		// anyway.
+		select {
+			case _ = <-notificationChan:
+
+			case err, ok := <-doneChan:
+				if ok {
+					return nil
+				}
+				return err
+		}
+	}
+}
+
 func (l *Listener) connect() {
+	var notificationChan chan Notification
 	var cn *ListenerConn
 	var err error
 
-	notificationChan := make(chan Notification, 32)
 	for {
-		cn, err = NewListenerConn(l.name, notificationChan)
-		if err == nil {
-			break
+		notificationChan = make(chan Notification, 32)
+		for {
+			cn, err = NewListenerConn(l.name, notificationChan)
+			if err == nil {
+				break
+			}
+
+			// XXX
+			//time.Sleep(5 * time.Second)
+			time.Sleep(1 * time.Millisecond)
 		}
 
-		// XXX
-		//time.Sleep(5 * time.Second)
+		l.lock.Lock()
+		if l.resync(cn, notificationChan) == nil {
+			break
+		}
+		l.lock.Unlock()
+		// fail :-(
 		time.Sleep(1 * time.Millisecond)
 	}
 
-	l.lock.Lock()
 	l.startListenRequestWorker()
 	l.cn = cn
 	l.notificationChan = notificationChan
+	l.broadcast(ListenerPidReconnect)
 	l.lock.Unlock()
 }
 
@@ -372,11 +476,16 @@ func (l *Listener) listenRequestWorkerMain() {
 				} else {
 					err = l.cn.Unlisten(request.relname)
 				}
+				//TODO
 				if err != nil {
 					panic(err)
 				}
 
-				//TODO: send a faux notification here
+				n := Notification{
+					BePid: ListenerPidOpen,
+					RelName: request.relname,
+				}
+				l.dispatch(n)
 
 			case shouldDie := <-l.listenRequestWorkerSignaler:
 				if !shouldDie {
@@ -393,32 +502,38 @@ func (l *Listener) Close() {
 	l.closed = true
 }
 
-// caller should be holding l.lock
-func (l *Listener) removeChannel(ch chan<- Notification) {
-	for m := range l.channels {
-		delete(l.channels[m], ch)
-	}
-}
-
 func (l *Listener) dispatch(n Notification) {
 	l.lock.Lock()
 	defer l.lock.Unlock()
 
 	m, ok := l.channels[n.RelName]
 	if !ok {
-		// could happen
+		// no listeners, try and UNLISTEN
+		err := l.requestListen(n.RelName, true)
+		if err != nil && err != ErrBufferFull {
+			// shouldn't happen
+			panic(err)
+		}
 		return
 	}
 
-	for ch := range m {
-		//panic(fmt.Sprintf("%#v", ch))
+	// sanity check; no empty maps should appear in channels
+	if len(m) == 0 {
+		panic("len(m) == 0")
+	}
+
+	for _, lnc := range m {
+		if lnc.ch == nil {
+			continue
+		}
+
 		select {
-			case ch <- n:
+			case lnc.ch <- n:
 
 			default:
-				// glock the channel
-				close(ch)
-				l.removeChannel(ch)
+				// Glock the channel
+				close(lnc.ch)
+				lnc.ch = nil
 		}
 	}
 }

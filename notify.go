@@ -173,7 +173,8 @@ func quoteRelname(relname string) string {
 func (l *ListenerConn) execSimpleQuery(q string) (err error) {
 	defer errRecover(&err)
 
-	b := l.cn.writeBuf('Q')
+	data := writeBuf([]byte("Q\x00\x00\x00\x00"))
+	b := &data
 	b.string(q)
 	l.cn.send(b)
 

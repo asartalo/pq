@@ -372,9 +372,9 @@ func (l *Listener) broadcast(pid int) {
 
 		select {
 			case lnc.ch <- n:
+
 			default:
-				close(lnc.ch)
-				lnc.ch = nil
+				l.removeListenClient(lnc)
 		}
 	}
 }
@@ -498,6 +498,21 @@ func (l *Listener) Close() {
 	l.closed = true
 }
 
+func (l *Listener) removeListenClient(lnc *listenClient) {
+	for relname := range(lnc.relnames) {
+		// sanity check
+		_, ok := l.channels[relname][lnc.ch]
+		if !ok {
+			panic("missing entry")
+		}
+		delete(l.channels[relname], lnc.ch)
+	}
+	lnc.relnames = nil
+	delete(l.listenClients, lnc.ch)
+	close(lnc.ch)
+	lnc.ch = nil
+}
+
 func (l *Listener) dispatch(n Notification) {
 	l.lock.Lock()
 	defer l.lock.Unlock()
@@ -519,17 +534,11 @@ func (l *Listener) dispatch(n Notification) {
 	}
 
 	for _, lnc := range m {
-		if lnc.ch == nil {
-			continue
-		}
-
 		select {
 			case lnc.ch <- n:
 
 			default:
-				// Glock the channel
-				close(lnc.ch)
-				lnc.ch = nil
+				l.removeListenClient(lnc)
 		}
 	}
 }

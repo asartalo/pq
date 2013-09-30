@@ -111,18 +111,9 @@ func (l *ListenerConn) releaseToken() {
 	}
 }
 
-func (l *ListenerConn) recv() (typ byte, buf *readBuf, err error) {
-	typ, buf, err = l.cn.recvMessage()
-	if err != nil {
-		return
-	}
-
-	return
-}
-
 func (l *ListenerConn) listenerConnMain() {
 	for {
-		t, r, err := l.recv()
+		t, r, err := l.cn.recvMessage()
 		if err != nil {
 			// Make sure nobody tries to start any new queries.  We can't
 			// simply close senderToken or acquireToken() would panic; see
@@ -402,8 +393,8 @@ func (l *Listener) resync(cn *ListenerConn, notificationChan <-chan Notification
 	}()
 
 	for {
-		// Ignore notifications to avoid deadlocks; we'll broadcast a Reconnect
-		// anyway.
+		// Ignore notifications while the synchronization is going on to avoid
+		// deadlocks; we'll broadcast a Reconnect for every channel anyway.
 		select {
 			case _ = <-notificationChan:
 
@@ -416,7 +407,7 @@ func (l *Listener) resync(cn *ListenerConn, notificationChan <-chan Notification
 	}
 }
 
-func (l *Listener) connect() {
+func (l *Listener) connect() bool {
 	var notificationChan chan Notification
 	var cn *ListenerConn
 	var err error
@@ -424,6 +415,12 @@ func (l *Listener) connect() {
 	for {
 		notificationChan = make(chan Notification, 32)
 		for {
+			l.lock.Lock()
+			if l.closed {
+				return false
+			}
+			l.lock.Unlock()
+
 			cn, err = NewListenerConn(l.name, notificationChan)
 			if err == nil {
 				break
@@ -449,6 +446,8 @@ func (l *Listener) connect() {
 	l.notificationChan = notificationChan
 	l.broadcast(ListenerPidReconnect)
 	l.lock.Unlock()
+
+	return true
 }
 
 // caller must be holding l.lock
@@ -504,6 +503,12 @@ die:
 }
 
 func (l *Listener) Close() {
+	l.lock.Lock()
+	defer l.lock.Unlock()
+
+	if l.cn != nil {
+		l.cn.Close()
+	}
 	l.closed = true
 }
 
@@ -528,7 +533,7 @@ func (l *Listener) dispatch(n Notification) {
 
 	channel, ok := l.channels[n.RelName]
 	if !ok {
-		// a NOTIFY was queued for a channel we've (or are about to) issue an
+		// A NOTIFY was queued for a channel we've (or are about to) issue an
 		// UNLISTEN for; no problem
 		return
 	}
@@ -560,7 +565,9 @@ func (l *Listener) dispatch(n Notification) {
 
 func (l *Listener) listenerMain() {
 	for {
-		l.connect()
+		if !l.connect() {
+			break
+		}
 
 		for {
 			notification, ok := <-l.notificationChan
@@ -572,7 +579,7 @@ func (l *Listener) listenerMain() {
 		}
 
 		if l.closed {
-			return
+			break
 		}
 
 		l.disconnectCleanup()

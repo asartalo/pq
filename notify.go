@@ -264,11 +264,13 @@ func (l *ListenerConn) Err() error {
 }
 
 
+
 type Listener struct {
 	name string
 
 	lock sync.Mutex
-	closed bool
+	isClosed bool
+	reconnectCond *sync.Cond
 	cn *ListenerConn
 	connNotificationChan <-chan Notification
 	channels map[string] bool
@@ -280,38 +282,43 @@ func NewListener(name string) (*Listener, error) {
 	l := &Listener{
 		name: name,
 		lock: sync.Mutex{},
-		closed: false,
+		isClosed: false,
 		cn: nil,
 		connNotificationChan: nil,
 		channels: make(map[string] bool),
 
-		Notify: make(chan Notification, 32),
+		Notify: make(chan Notification, 64),
 	}
+	l.reconnectCond = sync.NewCond(&l.lock)
 
 	go l.listenerMain()
 
 	return l, nil
 }
 
-func (l *Listener) Listen(relname string) (bool, error) {
+func (l *Listener) Listen(relname string) error {
 	l.lock.Lock()
 	defer l.lock.Unlock()
 
 	_, exists := l.channels[relname]
 	if exists {
-		return false, fmt.Errorf("chanenl aalreadyu")
+		return fmt.Errorf("chanenl aalreadyu")
 	}
 
+	if l.cn != nil {
+		err := l.cn.Listen(relname)
+		if err != nil {
+			// XXX we should only fail on a PGError here
+			return err
+		}
+	}
+
+	// add us to the list of channels and wait for a resync
 	l.channels[relname] = true
-	if l.cn == nil {
-		return false, nil
+	for l.cn == nil {
+		l.reconnectCond.Wait()
 	}
-
-	err := l.cn.Listen(relname)
-	if err != nil {
-		return false, nil
-	}
-	return true, nil
+	return nil
 }
 
 func (l *Listener) Unlisten(relname string) error {
@@ -324,18 +331,21 @@ func (l *Listener) Unlisten(relname string) error {
 	}
 
 	delete(l.channels, relname)
-	if l.cn == nil {
-		return nil
+	if l.cn != nil {
+		// what do on failure here? I think the interface should
+		// specify that the caller should not retry on error
+		return l.cn.Unlisten(relname)
 	}
 
-	_ = l.cn.Unlisten(relname)
 	return nil
 }
 
 func (l *Listener) disconnectCleanup() {
 	l.lock.Lock()
+	defer l.lock.Unlock()
+
+	l.cn.Close()
 	l.cn = nil
-	l.lock.Unlock()
 }
 
 func (l *Listener) resync(cn *ListenerConn, notificationChan <-chan Notification) error {
@@ -369,6 +379,14 @@ func (l *Listener) resync(cn *ListenerConn, notificationChan <-chan Notification
 	}
 }
 
+// caller should NOT be holding l.lock
+func (l *Listener) closed() bool {
+	l.lock.Lock()
+	defer l.lock.Unlock()
+
+	return l.isClosed
+}
+
 func (l *Listener) connect() bool {
 	var notificationChan chan Notification
 	var cn *ListenerConn
@@ -377,11 +395,9 @@ func (l *Listener) connect() bool {
 	for {
 		notificationChan = make(chan Notification, 32)
 		for {
-			l.lock.Lock()
-			if l.closed {
+			if l.closed() {
 				return false
 			}
-			l.lock.Unlock()
 
 			cn, err = NewListenerConn(l.name, notificationChan)
 			if err == nil {
@@ -406,6 +422,7 @@ func (l *Listener) connect() bool {
 	l.cn = cn
 	l.connNotificationChan = notificationChan
 	//TODO l.broadcast(ListenerPidReconnect)
+	l.reconnectCond.Broadcast()
 	l.lock.Unlock()
 
 	l.Notify <- Notification{BePid: ListenerPidReconnect}
@@ -420,7 +437,7 @@ func (l *Listener) Close() {
 	if l.cn != nil {
 		l.cn.Close()
 	}
-	l.closed = true
+	l.isClosed = true
 }
 
 func (l *Listener) listenerMain() {
@@ -438,7 +455,7 @@ func (l *Listener) listenerMain() {
 			l.Notify <- notification
 		}
 
-		if l.closed {
+		if l.closed() {
 			break
 		}
 

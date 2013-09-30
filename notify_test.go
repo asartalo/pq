@@ -141,7 +141,7 @@ func TestListenerListen(t *testing.T) {
 	db := openTestConn(t)
 	defer db.Close()
 
-	_, err := l.Listen("notify_listen_test")
+	err := l.Listen("notify_listen_test")
 	if err != nil {
 		t.Fatal(err)
 	}

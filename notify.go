@@ -434,8 +434,9 @@ func (l *Listener) connect() {
 		if l.resync(cn, notificationChan) == nil {
 			break
 		}
-		l.lock.Unlock()
+
 		// fail :-(
+		l.lock.Unlock()
 		time.Sleep(1 * time.Millisecond)
 	}
 

@@ -339,8 +339,6 @@ func (l *Listener) Unlisten(relname string, c chan<- Notification) error {
 
 	delete(data, c)
 	if len(data) == 0 {
-		// Request the channel to be UNLISTENed.  ErrBufferFull is not a
-		// problem here; we'll just do it later.
 		if l.requestListen(relname, true) {
 			delete(l.channels, relname)
 		}

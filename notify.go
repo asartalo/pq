@@ -236,6 +236,12 @@ type listenClient struct {
 	relnames map[string] bool
 }
 
+type listenChannel struct {
+	relname string
+	open bool
+	clients map[chan<- Notification] *listenClient
+}
+
 type Listener struct {
 	name string
 	closed bool
@@ -248,7 +254,7 @@ type Listener struct {
 
 	lock sync.Mutex
 	listenClients map[chan<- Notification] *listenClient
-	channels map[string] map[chan<- Notification] *listenClient
+	channels map[string] *listenChannel
 }
 
 func NewListener(name string) (*Listener, error) {
@@ -261,7 +267,7 @@ func NewListener(name string) (*Listener, error) {
 		listenRequestWorkerSignaler: nil,
 		lock: sync.Mutex{},
 		listenClients: make(map[chan<- Notification] *listenClient),
-		channels: make(map[string] map[chan<- Notification] *listenClient),
+		channels: make(map[string] *listenChannel),
 	}
 
 	go l.listenerMain()
@@ -299,30 +305,35 @@ func (l *Listener) Listen(relname string, c chan<- Notification) (bool, error) {
 	}
 	lnc.relnames[relname] = true
 
-	data, ok := l.channels[relname]
+	channel, ok := l.channels[relname]
 	if ok {
-		// the connection is already listening on this channel, we're done
-		data[c] = lnc
-		if l.cn == nil {
-			// .. or would be, if there was a connection.  In this case we
-			// return false, and the caller will have to wait for the
-			// connection to be re-established.
-			return false, nil
+		// The channel exists, so we're either listening on it or about to.
+		// If the channel is open and the connection is presumed to still be
+		// alive, it's safe for the caller to assume it's listening on the
+		// channel.  In any other case, we have to tell the client it's not
+		// listening yet.
+		channel.clients[c] = lnc
+		if l.cn != nil && channel.open {
+			return true, nil
 		}
-		return true, nil
-	}
-
-	data = make(map[chan<- Notification] *listenClient, 1)
-	data[c] = lnc
-	l.channels[relname] = data
-
-	if l.cn == nil {
 		return false, nil
 	}
 
-	if !l.requestListen(relname, false) {
+	// Try and listen on the channel.  If that fails, there's nothing more we
+	// can (or should) do; the caller will have to retry later.  However, if
+	// there's no connection, there's no need to try that; just add the channel
+	// and the resync logic will take care the rest.
+	if l.cn != nil && !l.requestListen(relname, false) {
 		return false, ErrBufferFull
 	}
+
+	channel = &listenChannel{
+		relname: relname,
+		open: false,
+		clients: make(map[chan<- Notification] *listenClient, 1),
+	}
+	channel.clients[c] = lnc
+	l.channels[relname] = channel
 
 	return false, nil
 }
@@ -331,14 +342,14 @@ func (l *Listener) Unlisten(relname string, c chan<- Notification) error {
 	l.lock.Lock()
 	defer l.lock.Unlock()
 
-	data, ok := l.channels[relname]
+	channel, ok := l.channels[relname]
 	if !ok {
 		// already gone, nothing to do
 		return nil
 	}
 
-	delete(data, c)
-	if len(data) == 0 {
+	delete(channel.clients, c)
+	if len(channel.clients) == 0 {
 		if l.requestListen(relname, true) {
 			delete(l.channels, relname)
 		}
@@ -499,11 +510,11 @@ func (l *Listener) Close() {
 func (l *Listener) removeListenClient(lnc *listenClient) {
 	for relname := range(lnc.relnames) {
 		// sanity check
-		_, ok := l.channels[relname][lnc.ch]
+		_, ok := l.channels[relname].clients[lnc.ch]
 		if !ok {
 			panic("missing entry")
 		}
-		delete(l.channels[relname], lnc.ch)
+		delete(l.channels[relname].clients, lnc.ch)
 	}
 	lnc.relnames = nil
 	delete(l.listenClients, lnc.ch)
@@ -515,15 +526,14 @@ func (l *Listener) dispatch(n Notification) {
 	l.lock.Lock()
 	defer l.lock.Unlock()
 
-	m, ok := l.channels[n.RelName]
+	channel, ok := l.channels[n.RelName]
 	if !ok {
 		// a NOTIFY was queued for a channel we've (or are about to) issue an
 		// UNLISTEN for; no problem
 		return
 	}
 
-	// sanity check; no empty maps should appear in channels
-	if len(m) == 0 {
+	if len(channel.clients) == 0 {
 		// no listeners, try and UNLISTEN
 		if l.requestListen(n.RelName, true) {
 			delete(l.channels, n.RelName)
@@ -531,7 +541,14 @@ func (l *Listener) dispatch(n Notification) {
 		return
 	}
 
-	for _, lnc := range m {
+	// If the channel was recently opened, mark it as such.  We could do this
+	// for "real" notifications, too, but let's keep the semantics strict right
+	// now.
+	if n.BePid == ListenerPidOpen {
+		channel.open = true
+	}
+
+	for _, lnc := range channel.clients {
 		select {
 			case lnc.ch <- n:
 

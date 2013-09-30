@@ -133,28 +133,27 @@ func newTestListener(t *testing.T) (*Listener) {
 func TestListenerListen(t *testing.T) {
 	var n Notification
 
+	go func() { time.Sleep(7 * time.Second); panic(nil) }()
+
 	l := newTestListener(t)
 	defer l.Close()
 
 	db := openTestConn(t)
 	defer db.Close()
 
-	channel := make(chan Notification, 2)
-	connected, err := l.Listen("notify_listen_test", channel)
+	_, err := l.Listen("notify_listen_test")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if !connected {
-		select {
-			case n = <-channel:
-				if n.BePid != ListenerPidReconnect {
-					t.Errorf("expected ListenerPidReconnect, got %d", n.BePid)
-				}
+	select {
+		case n = <-l.Notify:
+			if n.BePid != ListenerPidReconnect {
+				t.Fatalf("unexpected BePid %d", n.BePid)
+			}
 
-			case <-time.After(5 * time.Second):
-				panic("timeout")
-		}
+		case <-time.After(5 * time.Second):
+			panic("timeout")
 	}
 
 	_, err = db.Exec("NOTIFY notify_listen_test")
@@ -163,8 +162,8 @@ func TestListenerListen(t *testing.T) {
 	}
 
 	select {
-		case n = <-channel:
-			if n.BePid < 0 {
+		case n = <-l.Notify:
+			if n.BePid < 1 {
 				t.Errorf("unexpected BePid %d", n.BePid)
 			}
 

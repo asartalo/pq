@@ -8,6 +8,7 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -44,6 +45,9 @@ type ListenerConn struct {
 
 	// guards only sending/closing of senderToken
 	lock sync.Mutex
+	// 1 if a receiving a response to a query is expected, 0 otherwise.  Only
+	// access using sync/atomic's functions.
+	queryInFlight int32
 	// see acquireToken()
 	senderToken chan bool
 
@@ -60,6 +64,7 @@ func NewListenerConn(name string, notificationChan chan<- Notification) (*Listen
 		cn: cn.(*conn),
 		notificationChan: notificationChan,
 		lock: sync.Mutex{},
+		queryInFlight: 0,
 		senderToken: make(chan bool, 1),
 		replyChan: make(chan message, 2),
 	}
@@ -92,13 +97,12 @@ func (l *ListenerConn) releaseToken() {
 	// If we lost the connection, the goroutine running listenerConnMain will
 	// have closed the channel.  As attempting to send on a closed channel
 	// panics in Go, we will not try and do that; instead, listenerConnMain
-	// sets the channel pointer to nil to let us know that the channel has been
-	// closed.  Obviously, we need be holding the mutex while checking for the
-	// channel's nil-ness, but that should not pose a problem as there's only
-	// one token anyway.
+	// sets the err pointer to let us know that the channel has been closed and
+	// this connection is going away.  Obviously, we need be holding the mutex
+	// while checking for the err pointer, but that should not be a problem.
 	l.lock.Lock()
 	defer l.lock.Unlock()
-	if l.senderToken == nil {
+	if l.err != nil {
 		return
 	}
 
@@ -111,28 +115,11 @@ func (l *ListenerConn) releaseToken() {
 	}
 }
 
-func (l *ListenerConn) listenerConnMain() {
+func (l *ListenerConn) listenerConnLoop() error {
 	for {
 		t, r, err := l.cn.recvMessage()
 		if err != nil {
-			// Make sure nobody tries to start any new queries.  We can't
-			// simply close senderToken or acquireToken() would panic; see
-			// comments near the beginning of that function.
-			l.lock.Lock()
-			close(l.senderToken)
-			l.senderToken = nil
-			l.lock.Unlock()
-
-			// There might be a query in-flight; make sure nobody's waiting for a
-			// response to it, since there's not going to be one.
-			close(l.replyChan)
-
-			// let the listener know we're done
-			l.err = err
-			close(l.notificationChan)
-
-			// this ListenerConn is done
-			return
+			return err
 		}
 
 		switch t {
@@ -140,8 +127,20 @@ func (l *ListenerConn) listenerConnMain() {
 			// notification
 			n := recvNotification(r)
 			l.notificationChan <- n
-		case 'C', 'E', 'Z':
-			// reply to a query
+		case 'E':
+			if atomic.LoadInt32(&l.queryInFlight) != 1 {
+				return parseError(r)
+			}
+			l.replyChan <- message{t, r}
+		case 'C':
+			if atomic.LoadInt32(&l.queryInFlight) != 1 {
+				return fmt.Errorf("unexpected CommandComplete")
+			}
+			l.replyChan <- message{t, r}
+		case 'Z':
+			if !atomic.CompareAndSwapInt32(&l.queryInFlight, 1, 0) {
+				return fmt.Errorf("unexpected ReadyForQuery")
+			}
 			l.replyChan <- message{t, r}
 		case 'T', 'N', 'S', 'D':
 			// ignore
@@ -149,6 +148,26 @@ func (l *ListenerConn) listenerConnMain() {
 			errorf("unknown response for simple query: %q", t)
 		}
 	}
+}
+
+func (l *ListenerConn) listenerConnMain() {
+	err := l.listenerConnLoop()
+	// Make sure nobody tries to start any new queries.  We have to
+	// also send err pointer while holding the lock or acquireToken()
+	// would panic; see comments near the beginning of that function.
+	l.lock.Lock()
+	close(l.senderToken)
+	l.err = err
+	l.lock.Unlock()
+
+	// There might be a query in-flight; make sure nobody's waiting for a
+	// response to it, since there's not going to be one.
+	close(l.replyChan)
+
+	// let the listener know we're done
+	close(l.notificationChan)
+
+	// this ListenerConn is done
 }
 
 func quoteRelname(relname string) string {
@@ -175,6 +194,11 @@ func (l *ListenerConn) Unlisten(relname string) error {
 
 func (l *ListenerConn) sendSimpleQuery(q string) (err error) {
 	defer errRecover(&err)
+
+	// set queryInFlight *before* sending the packet to avoid race condition
+	if !atomic.CompareAndSwapInt32(&l.queryInFlight, 0, 1) {
+		panic("invalid queryInFlight")
+	}
 
 	data := writeBuf([]byte("Q\x00\x00\x00\x00"))
 	b := &data
@@ -239,48 +263,29 @@ func (l *ListenerConn) Err() error {
 	return l.err
 }
 
-type listenRequest struct {
-	relname string
-	unlisten bool
-}
-
-type listenClient struct {
-	ch chan<- Notification
-	relnames map[string] bool
-}
-
-type listenChannel struct {
-	relname string
-	open bool
-	clients map[chan<- Notification] *listenClient
-}
 
 type Listener struct {
 	name string
-	closed bool
-	cn *ListenerConn
-	notificationChan <-chan Notification
-
-	listenRequestChan chan listenRequest
-	listenRequestWorkerSignaler chan bool
-	listenRequestWorkerWG sync.WaitGroup
 
 	lock sync.Mutex
-	listenClients map[chan<- Notification] *listenClient
-	channels map[string] *listenChannel
+	closed bool
+	cn *ListenerConn
+	connNotificationChan <-chan Notification
+	channels map[string] bool
+
+	Notify chan Notification
 }
 
 func NewListener(name string) (*Listener, error) {
 	l := &Listener{
 		name: name,
+		lock: sync.Mutex{},
 		closed: false,
 		cn: nil,
-		notificationChan: nil,
-		listenRequestChan: nil,
-		listenRequestWorkerSignaler: nil,
-		lock: sync.Mutex{},
-		listenClients: make(map[chan<- Notification] *listenClient),
-		channels: make(map[string] *listenChannel),
+		connNotificationChan: nil,
+		channels: make(map[string] bool),
+
+		Notify: make(chan Notification, 32),
 	}
 
 	go l.listenerMain()
@@ -288,120 +293,49 @@ func NewListener(name string) (*Listener, error) {
 	return l, nil
 }
 
-func (l *Listener) requestListen(relname string, unlisten bool) bool {
-	request := listenRequest{
-		relname: relname,
-		unlisten: unlisten,
-	}
-	select {
-		case l.listenRequestChan <-request:
-			return true
-		default:
-			return false
-	}
-}
-
-func (l *Listener) Listen(relname string, c chan<- Notification) (bool, error) {
+func (l *Listener) Listen(relname string) (bool, error) {
 	l.lock.Lock()
 	defer l.lock.Unlock()
 
-	lnc, ok := l.listenClients[c]
-	if !ok {
-		lnc = &listenClient{
-			ch: c,
-			relnames: make(map[string] bool, 1),
-		}
-		l.listenClients[c] = lnc
+	_, exists := l.channels[relname]
+	if exists {
+		return false, fmt.Errorf("chanenl aalreadyu")
 	}
-	if lnc.ch == nil {
-		lnc.ch = c
-	}
-	lnc.relnames[relname] = true
 
-	channel, ok := l.channels[relname]
-	if ok {
-		// The channel exists, so we're either listening on it or about to.
-		// If the channel is open and the connection is presumed to still be
-		// alive, it's safe for the caller to assume it's listening on the
-		// channel.  In any other case, we have to tell the client it's not
-		// listening yet.
-		channel.clients[c] = lnc
-		if l.cn != nil && channel.open {
-			return true, nil
-		}
+	l.channels[relname] = true
+	if l.cn == nil {
 		return false, nil
 	}
 
-	// Try and listen on the channel.  If that fails, there's nothing more we
-	// can (or should) do; the caller will have to retry later.  However, if
-	// there's no connection, there's no need to try that; just add the channel
-	// and the resync logic will take care the rest.
-	if l.cn != nil && !l.requestListen(relname, false) {
-		return false, ErrBufferFull
+	err := l.cn.Listen(relname)
+	if err != nil {
+		return false, nil
 	}
-
-	channel = &listenChannel{
-		relname: relname,
-		open: false,
-		clients: make(map[chan<- Notification] *listenClient, 1),
-	}
-	channel.clients[c] = lnc
-	l.channels[relname] = channel
-
-	return false, nil
+	return true, nil
 }
 
-func (l *Listener) Unlisten(relname string, c chan<- Notification) error {
+func (l *Listener) Unlisten(relname string) error {
 	l.lock.Lock()
 	defer l.lock.Unlock()
 
-	// sanity check
-	_, ok := l.listenClients[c]
-	if !ok {
-		panic("missing entry")
+	_, exists := l.channels[relname]
+	if !exists {
+		return fmt.Errorf("channel no")
 	}
-	delete(l.listenClients, c)
 
-	channel, ok := l.channels[relname]
-	if !ok {
-		// already gone, nothing to do
+	delete(l.channels, relname)
+	if l.cn == nil {
 		return nil
 	}
 
-	delete(channel.clients, c)
-	if len(channel.clients) == 0 {
-		if l.requestListen(relname, true) {
-			delete(l.channels, relname)
-		}
-	}
+	_ = l.cn.Unlisten(relname)
 	return nil
 }
 
 func (l *Listener) disconnectCleanup() {
-	l.killListenRequestWorker()
-	l.listenRequestWorkerWG.Wait()
-
 	l.lock.Lock()
-	close(l.listenRequestChan)
-	l.listenRequestChan = nil
-	close(l.listenRequestWorkerSignaler)
-	l.listenRequestWorkerSignaler = nil
+	l.cn = nil
 	l.lock.Unlock()
-}
-
-// caller must be holding l.lock
-func (l *Listener) broadcast(pid int) {
-	n := Notification{
-		BePid: pid,
-	}
-	for _, lnc := range l.listenClients {
-		select {
-			case lnc.ch <- n:
-
-			default:
-				l.removeListenClient(lnc)
-		}
-	}
 }
 
 func (l *Listener) resync(cn *ListenerConn, notificationChan <-chan Notification) error {
@@ -419,7 +353,7 @@ func (l *Listener) resync(cn *ListenerConn, notificationChan <-chan Notification
 
 	for {
 		// Ignore notifications while the synchronization is going on to avoid
-		// deadlocks; we'll broadcast a Reconnect for every channel anyway.
+		// deadlocks; we'll send a Reconnect anyway
 		select {
 			case _, ok := <-notificationChan:
 				if !ok {
@@ -469,71 +403,14 @@ func (l *Listener) connect() bool {
 		time.Sleep(1 * time.Millisecond)
 	}
 
-	l.startListenRequestWorker()
 	l.cn = cn
-	l.notificationChan = notificationChan
-	l.broadcast(ListenerPidReconnect)
+	l.connNotificationChan = notificationChan
+	//TODO l.broadcast(ListenerPidReconnect)
 	l.lock.Unlock()
 
+	l.Notify <- Notification{BePid: ListenerPidReconnect}
+
 	return true
-}
-
-// caller must be holding l.lock
-func (l *Listener) startListenRequestWorker() {
-	l.listenRequestWorkerWG = sync.WaitGroup{}
-	l.listenRequestWorkerWG.Add(1)
-	l.listenRequestChan = make(chan listenRequest, 32)
-	l.listenRequestWorkerSignaler = make(chan bool, 1)
-
-	go l.listenRequestWorkerMain()
-}
-
-func (l *Listener) killListenRequestWorker() {
-	select {
-		case l.listenRequestWorkerSignaler <- true:
-
-		// sanity check
-		default:
-			panic("listenRequestWorkerSignaler channel full")
-	}
-}
-
-func (l *Listener) listenRequestWorkerMain() {
-	for {
-		select {
-			case request := <-l.listenRequestChan:
-				var err error
-				if !request.unlisten {
-					err = l.cn.Listen(request.relname)
-				} else {
-					err = l.cn.Unlisten(request.relname)
-				}
-				// no way to recover; close the connection and try again
-				if err != nil {
-					// shouldn't need to lock here, I think, but doesn't hurt
-					l.lock.Lock()
-					if l.cn != nil {
-						l.cn.Close()
-					}
-					l.lock.Unlock()
-					goto die
-				}
-
-				n := Notification{
-					BePid: ListenerPidOpen,
-					RelName: request.relname,
-				}
-				l.dispatch(n)
-
-			case shouldDie := <-l.listenRequestWorkerSignaler:
-				if !shouldDie {
-					panic("shouldDie == false")
-				}
-				goto die
-		}
-	}
-die:
-	l.listenRequestWorkerWG.Done()
 }
 
 func (l *Listener) Close() {
@@ -546,71 +423,6 @@ func (l *Listener) Close() {
 	l.closed = true
 }
 
-// caller must be holding l.lock
-func (l *Listener) removeListenClient(lnc *listenClient) {
-	for relname := range(lnc.relnames) {
-		// sanity check
-		_, ok := l.channels[relname].clients[lnc.ch]
-		if !ok {
-			panic("missing entry")
-		}
-		delete(l.channels[relname].clients, lnc.ch)
-	}
-	lnc.relnames = nil
-	// sanity check
-	_, ok := l.listenClients[lnc.ch]
-	if !ok {
-		panic("missing entry")
-	}
-	delete(l.listenClients, lnc.ch)
-	close(lnc.ch)
-	lnc.ch = nil
-}
-
-func (l *Listener) dispatch(n Notification) {
-	l.lock.Lock()
-	defer l.lock.Unlock()
-
-	channel, ok := l.channels[n.RelName]
-	if !ok {
-		// A NOTIFY was queued for a channel we've (or are about to) issue an
-		// UNLISTEN for; no problem
-		return
-	}
-
-	if len(channel.clients) == 0 {
-		// no listeners, try and UNLISTEN
-		if l.requestListen(n.RelName, true) {
-			delete(l.channels, n.RelName)
-		}
-		return
-	}
-
-	// If the channel was recently opened, mark it as such.  We could do this
-	// for "real" notifications, too, but let's keep the semantics strict right
-	// now.
-	if n.BePid == ListenerPidOpen {
-		channel.open = true
-	}
-
-	for _, lnc := range channel.clients {
-		select {
-			case lnc.ch <- n:
-
-			default:
-				l.removeListenClient(lnc)
-		}
-	}
-}
-
-// XXX remove?
-func (l *Listener) ListenChannels() int {
-	l.lock.Lock()
-	defer l.lock.Unlock()
-
-	return len(l.channels)
-}
-
 func (l *Listener) listenerMain() {
 	for {
 		if !l.connect() {
@@ -618,12 +430,12 @@ func (l *Listener) listenerMain() {
 		}
 
 		for {
-			notification, ok := <-l.notificationChan
+			notification, ok := <-l.connNotificationChan
 			if !ok {
 				// lost connection, loop again
 				break
 			}
-			l.dispatch(notification)
+			l.Notify <- notification
 		}
 
 		if l.closed {

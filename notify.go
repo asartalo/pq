@@ -481,8 +481,7 @@ func (l *Listener) connect() bool {
 			}
 
 			// XXX
-			//time.Sleep(5 * time.Second)
-			time.Sleep(1 * time.Millisecond)
+			time.Sleep(1 * time.Second)
 		}
 
 		l.lock.Lock()
@@ -490,14 +489,19 @@ func (l *Listener) connect() bool {
 			break
 		}
 
-		// fail :-(
+		if l.closed() {
+			return false
+		}
+
+		// resync failed; retry the connection procedure from the beginning
 		l.lock.Unlock()
-		time.Sleep(1 * time.Millisecond)
+
+		// XXX
+		time.Sleep(1 * time.Second)
 	}
 
 	l.cn = cn
 	l.connNotificationChan = notificationChan
-	//TODO l.broadcast(ListenerPidReconnect)
 	l.reconnectCond.Broadcast()
 	l.lock.Unlock()
 
@@ -519,7 +523,7 @@ func (l *Listener) Close() {
 func (l *Listener) listenerMain() {
 	for {
 		if !l.connect() {
-			break
+			return
 		}
 
 		for {
@@ -530,12 +534,13 @@ func (l *Listener) listenerMain() {
 			}
 			l.Notify <- notification
 		}
+		l.disconnectCleanup()
+
+		l.Notify <- Notification{BePid: ListenerPidDisconnect}
 
 		if l.closed() {
-			break
+			return
 		}
-
-		l.disconnectCleanup()
 	}
 }
 

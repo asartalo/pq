@@ -268,10 +268,10 @@ func (l *ListenerConn) sendSimpleQuery(q string) (err error) {
 
 // Execute a "simple query" (i.e. one with no bindable parameters) on the
 // connection.  The first return parameter is true if the query was executed
-// on the connection (if the query failed, "error" will be set to the error
-// message we received from the server), or false if we didn't manage to
-// execute the server on the query, in which case the connection will be closed
-// and all subsequent queries will return an error.
+// on the connection (if the query failed with an error message, "error" will
+// be set to the error message we received from the server), or false if we did
+// not manage to execute the server on the query, in which case the connection
+// will be closed and all subsequently executed queries will return an error.
 func (l *ListenerConn) execSimpleQuery(q string) (bool, error) {
 	if !l.acquireToken() {
 		return false, io.EOF

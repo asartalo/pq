@@ -84,10 +84,11 @@ A call to Listen() will only fail in two cases:
 * The channel is already open.  The returned error will be
   ErrChannelAlreadyOpen.
 * The query was executed on the remote server, but PostgreSQL returned an error
-  message.
+  message.  The returned error will be a pq.Error containing the information
+  the server supplied.
 
 In all other cases Listener will make sure to deliver the command to the
-server, possibly re-establishing the connection if necessary.
+server, re-establishing the connection if necessary.
 
 After a successful call to Listen, notifications can be received from the
 Listener.Notify channel.  The returned Notification structure looks as follows:

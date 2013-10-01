@@ -13,8 +13,7 @@ import (
 )
 
 var ErrChannelAlreadyOpen = errors.New("channel is already open")
-var ErrChannelNotOpen = errors.new("channel is not open")
-
+var ErrChannelNotOpen = errors.New("channel is not open")
 
 const ListenerPidOpen = -100
 const ListenerPidDisconnect = -101
@@ -310,7 +309,7 @@ func (l *ListenerConn) execSimpleQuery(q string) (bool, error) {
 		case 'C':
 			// query succeeded, wait for ReadyForQuery
 		default:
-			errorf("unknown response for simple query: %q", t)
+			return false, Error(fmt.Errorf("unknown response for simple query: %q", t))
 		}
 	}
 }

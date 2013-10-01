@@ -12,7 +12,16 @@ import (
 	"time"
 )
 
-var ErrBufferFull = errors.New("listener: buffer full")
+
+const ListenerPidOpen = -100
+const ListenerPidDisconnect = -101
+const ListenerPidReconnect = -102
+
+type Notification struct {
+	BePid   int
+	RelName string
+	Extra   string
+}
 
 func recvNotification(r *readBuf) Notification {
 	bePid := r.int32()
@@ -25,16 +34,6 @@ func recvNotification(r *readBuf) Notification {
 type message struct {
 	typ byte
 	buf *readBuf
-}
-
-const ListenerPidOpen = -100
-const ListenerPidDisconnect = -101
-const ListenerPidReconnect = -102
-
-type Notification struct {
-	BePid   int
-	RelName string
-	Extra   string
 }
 
 const (
@@ -80,8 +79,8 @@ func NewListenerConn(name string, notificationChan chan<- Notification) (*Listen
 	return l, nil
 }
 
-// acquireToken() attempts to grab the token a goroutine needs to be holding
-// to be allowed to send anything on the connection.  Waits until the token is
+// acquireToken() attempts to grab the token a goroutine needs to be holding to
+// be allowed to send anything on the connection.  It waits until the token is
 // in the caller's possession, or returns false if the connection has been
 // closed and no further sends should be attempted.
 func (l *ListenerConn) acquireToken() bool {
@@ -136,6 +135,11 @@ func (l *ListenerConn) setState(newState int32) bool {
 	return atomic.CompareAndSwapInt32(&l.connState, expectedState, newState)
 }
 
+// Main logic is here: receive messages from the postgres backend, forward
+// notifications and query replies and keep the internal state in sync with the
+// protocol state.  Returns when the connection has been lost, is about to go
+// away or should be discarded because we couldn't agree on the state with the
+// server backend.
 func (l *ListenerConn) listenerConnLoop() error {
 	for {
 		t, r, err := l.cn.recvMessage()
@@ -178,11 +182,23 @@ func (l *ListenerConn) listenerConnLoop() error {
 	}
 }
 
+// This is the main routine for the goroutine receiving on the database
+// connection.  Most of the main logic is in listenerConnLoop.
 func (l *ListenerConn) listenerConnMain() {
 	err := l.listenerConnLoop()
-	// Make sure nobody tries to start any new queries.  We have to
-	// also send err pointer while holding the lock or acquireToken()
-	// would panic; see comments near the beginning of that function.
+
+	// Make sure nobody tries to start any new queries.  We have to also set
+	// the err pointer while holding the lock or acquireToken() would panic;
+	// see comments near the beginning of that function.
+	//
+	// Noteworthy is that we only set err if it hasn't already been set.  That
+	// is because the connection could be closed by either this goroutine or
+	// one sending on the connection -- whoever closes the connection is
+	// assumed to have the more meaningful error message (as the other one will
+	// probably get net.errConnClosed), so that goroutine sets the error we
+	// expose, and the other one's error is discarded.  If the connection is
+	// lost while two goroutines are operating on the socket, it probably
+	// doesn't matter which error we expose.
 	l.lock.Lock()
 	close(l.senderToken)
 	if l.err == nil {
@@ -202,6 +218,7 @@ func (l *ListenerConn) listenerConnMain() {
 }
 
 func quoteRelname(relname string) string {
+	// Relnames for channels are always quoted, and thus case sensitive.
 	return fmt.Sprintf(`"%s"`, strings.Replace(relname, `"`, `""`, -1))
 }
 
@@ -217,25 +234,19 @@ func (l *ListenerConn) TESTRunAnyQuery(q string) (bool, error) {
 	return l.execSimpleQuery(q)
 }
 
-
+// Send a LISTEN query to the server.  See execSimpleQuery.
 func (l *ListenerConn) Listen(relname string) (bool, error) {
-	if !l.acquireToken() {
-		return false, io.EOF
-	}
-	defer l.releaseToken()
-
 	return l.execSimpleQuery("LISTEN " + quoteRelname(relname))
 }
 
+// Send an UNLISTEN query to the server.  See execSimpleQuery.
 func (l *ListenerConn) Unlisten(relname string) (bool, error) {
-	if !l.acquireToken() {
-		return false, io.EOF
-	}
-	defer l.releaseToken()
-
 	return l.execSimpleQuery("UNLISTEN " + quoteRelname(relname))
 }
 
+// Attempt to send a query on the connection.  Returns an error if sending the
+// query failed, and the caller should initiate closure of this connection.
+// The caller must be holding senderToken (see acquireToken and releaseToken).
 func (l *ListenerConn) sendSimpleQuery(q string) (err error) {
 	defer errRecover(&err)
 
@@ -252,12 +263,24 @@ func (l *ListenerConn) sendSimpleQuery(q string) (err error) {
 	return nil
 }
 
+// Execute a "simple query" (i.e. one with no bindable parameters) on the
+// connection.  The first return parameter is true if the query was executed
+// on the connection (if the query failed, "error" will be set to the error
+// message we received from the server), or false if we didn't manage to
+// execute the server on the query, in which case the connection will be closed
+// and all subsequent queries will return an error.
 func (l *ListenerConn) execSimpleQuery(q string) (bool, error) {
+	if !l.acquireToken() {
+		return false, io.EOF
+	}
+	defer l.releaseToken()
+
 	err := l.sendSimpleQuery(q)
 	if err != nil {
 		// We can't know what state the protocol is in, so we need to abandon
 		// this connection.
 		l.lock.Lock()
+		// see listenerConnMain()
 		if l.err == nil {
 			l.err = err
 		}
@@ -281,7 +304,7 @@ func (l *ListenerConn) execSimpleQuery(q string) (bool, error) {
 		case 'E':
 			err = parseError(r)
 		case 'C':
-			// query succeeded, nothing to do
+			// query succeeded, wait for ReadyForQuery
 		default:
 			errorf("unknown response for simple query: %q", t)
 		}
@@ -293,7 +316,7 @@ func (l *ListenerConn) Close() error {
 }
 
 // Err() returns the reason the connection was closed.  You shouldn't call this
-// function until l.notificationChan has been closed.
+// function until l.Notify has been closed.
 func (l *ListenerConn) Err() error {
 	return l.err
 }

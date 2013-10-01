@@ -83,11 +83,13 @@ by the PostgreSQL server.
 After a successful call to Listen, notifications can be received from the
 Listener.Notify channel.  The returned Notification structure looks as follows:
 
+`
 type Notification struct {
     BePid   int
     RelName string
     Extra   string
 }
+`
 
 BePid is the Process ID (PID) of the notifying PostgreSQL server backend.
 RelName is the name of the channel.  Extra is a special payload string which

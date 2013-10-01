@@ -165,18 +165,21 @@ func (l *ListenerConn) listenerConnLoop() error {
 				return parseError(r)
 			}
 			l.replyChan <- message{t, r}
+
 		case 'C':
 			if !l.setState(connStateExpectReadyForQuery) {
 				// protocol out of sync
 				return fmt.Errorf("unexpected CommandComplete")
 			}
 			l.replyChan <- message{t, r}
+
 		case 'Z':
 			if !l.setState(connStateIdle) {
 				// protocol out of sync
 				return fmt.Errorf("unexpected ReadyForQuery")
 			}
 			l.replyChan <- message{t, r}
+
 		case 'T', 'N', 'S', 'D':
 			// ignore
 		default:

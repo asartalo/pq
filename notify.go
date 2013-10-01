@@ -12,6 +12,9 @@ import (
 	"time"
 )
 
+var ErrChannelAlreadyOpen = errors.New("channel is already open")
+var ErrChannelNotOpen = errors.new("channel is not open")
+
 
 const ListenerPidOpen = -100
 const ListenerPidDisconnect = -101
@@ -96,13 +99,14 @@ func (l *ListenerConn) acquireToken() bool {
 	return token
 }
 
+// Release the token acquire by acquireToken.
 func (l *ListenerConn) releaseToken() {
 	// If we lost the connection, the goroutine running listenerConnMain will
 	// have closed the channel.  As attempting to send on a closed channel
 	// panics in Go, we will not try and do that; instead, listenerConnMain
 	// sets the err pointer to let us know that the channel has been closed and
 	// this connection is going away.  Obviously, we need be holding the mutex
-	// while checking for the err pointer, but that should not be a problem.
+	// while checking the err pointer, but that should not be a problem.
 	l.lock.Lock()
 	defer l.lock.Unlock()
 	if l.err != nil {
@@ -315,8 +319,8 @@ func (l *ListenerConn) Close() error {
 	return l.cn.Close()
 }
 
-// Err() returns the reason the connection was closed.  You shouldn't call this
-// function until l.Notify has been closed.
+// Err() returns the reason the connection was closed.  It is not safe to call
+// this function until l.Notify has been closed.
 func (l *ListenerConn) Err() error {
 	return l.err
 }
@@ -358,27 +362,35 @@ func (l *Listener) Listen(relname string) error {
 	l.lock.Lock()
 	defer l.lock.Unlock()
 
+	// XXX the postgres server allows this; maybe we should, too?  on the other
+	// hand, this could be a reasonable sanity check and it's easy to check for
+	// the exposed error message anyway if the caller doesn't know whether it's
+	// listening or not.
 	_, exists := l.channels[relname]
 	if exists {
-		return fmt.Errorf("chanenl aalreadyu")
+		return ErrChannelAlreadyOpen
 	}
 
 	if l.cn != nil {
-		// XXX this deserves a comment
+		// If gotResponse is true but error is set, the query was executed on
+		// the remote server, but resulted in an error.  This should be
+		// relatively rare, so it's fine if we just pass the error to our
+		// caller.  However, if gotResponse is false, we could not complete the
+		// query on the remote server, and this connection is about to go away.
+		// We only have to add it to l.channels, and wait for resync() to take
+		// care of the rest.
 		gotResponse, err := l.cn.Listen(relname)
 		if gotResponse && err != nil {
 			return err
 		}
 		l.channels[relname] = true
-		return nil
-	} else {
-		// add us to the list of channels and wait for a resync
-		l.channels[relname] = true
-		for l.cn == nil {
-			l.reconnectCond.Wait()
-		}
-		return nil
 	}
+
+	l.channels[relname] = true
+	for l.cn == nil {
+		l.reconnectCond.Wait()
+	}
+	return nil
 }
 
 func (l *Listener) Unlisten(relname string) error {
@@ -387,15 +399,20 @@ func (l *Listener) Unlisten(relname string) error {
 
 	_, exists := l.channels[relname]
 	if !exists {
-		return fmt.Errorf("channel no")
+		return ErrChannelNotOpen
 	}
 
 	if l.cn != nil {
+		// Similarly to Listen (see comment in that function), the caller
+		// should only be bothered with an error if it came from the backend as
+		// a response to our query.
 		gotResponse, err := l.cn.Unlisten(relname)
 		if gotResponse && err != nil {
 			return err
 		}
 	}
+
+	// don't bother waiting for resync
 	delete(l.channels, relname)
 	return nil
 }
@@ -423,7 +440,7 @@ func (l *Listener) resync(cn *ListenerConn, notificationChan <-chan Notification
 
 	for {
 		// Ignore notifications while the synchronization is going on to avoid
-		// deadlocks; we'll send a Reconnect anyway
+		// deadlocks; we'll send a Reconnect after the synchronization is done.
 		select {
 			case _, ok := <-notificationChan:
 				if !ok {
@@ -522,5 +539,4 @@ func (l *Listener) listenerMain() {
 		l.disconnectCleanup()
 	}
 }
-
 

@@ -37,6 +37,12 @@ type Notification struct {
 	Extra   string
 }
 
+const (
+	connStateIdle int32 = iota
+	connStateExpectResponse
+	connStateExpectReadyForQuery
+)
+
 type ListenerConn struct {
 	cn *conn
 	err error
@@ -45,9 +51,7 @@ type ListenerConn struct {
 
 	// guards only sending/closing of senderToken
 	lock sync.Mutex
-	// 1 if a receiving a response to a query is expected, 0 otherwise.  Only
-	// access using sync/atomic's functions.
-	queryInFlight int32
+	connState int32
 	// see acquireToken()
 	senderToken chan bool
 
@@ -64,7 +68,7 @@ func NewListenerConn(name string, notificationChan chan<- Notification) (*Listen
 		cn: cn.(*conn),
 		notificationChan: notificationChan,
 		lock: sync.Mutex{},
-		queryInFlight: 0,
+		connState: connStateIdle,
 		senderToken: make(chan bool, 1),
 		replyChan: make(chan message, 2),
 	}
@@ -115,6 +119,23 @@ func (l *ListenerConn) releaseToken() {
 	}
 }
 
+func (l *ListenerConn) setState(newState int32) bool {
+	var expectedState int32
+
+	switch newState {
+	case connStateExpectResponse:
+		expectedState = connStateIdle
+	case connStateExpectReadyForQuery:
+		expectedState = connStateExpectResponse
+	case connStateIdle:
+		expectedState = connStateExpectReadyForQuery
+	default:
+		panic(fmt.Sprintf("unexpected listenerConnState %d", newState))
+	}
+
+	return atomic.CompareAndSwapInt32(&l.connState, expectedState, newState)
+}
+
 func (l *ListenerConn) listenerConnLoop() error {
 	for {
 		t, r, err := l.cn.recvMessage()
@@ -127,25 +148,32 @@ func (l *ListenerConn) listenerConnLoop() error {
 			// notification
 			n := recvNotification(r)
 			l.notificationChan <- n
+
 		case 'E':
-			if atomic.LoadInt32(&l.queryInFlight) != 1 {
+			// We might receive an ErrorResponse even when not in a query; it
+			// is expected that the server will close the connection after
+			// that, but we should make sure that the error we display is the
+			// one from the stray ErrorResponse, not io.ErrUnexpectedEOF.
+			if !l.setState(connStateExpectReadyForQuery) {
 				return parseError(r)
 			}
 			l.replyChan <- message{t, r}
 		case 'C':
-			if atomic.LoadInt32(&l.queryInFlight) != 1 {
+			if !l.setState(connStateExpectReadyForQuery) {
+				// protocol out of sync
 				return fmt.Errorf("unexpected CommandComplete")
 			}
 			l.replyChan <- message{t, r}
 		case 'Z':
-			if !atomic.CompareAndSwapInt32(&l.queryInFlight, 1, 0) {
+			if !l.setState(connStateIdle) {
+				// protocol out of sync
 				return fmt.Errorf("unexpected ReadyForQuery")
 			}
 			l.replyChan <- message{t, r}
 		case 'T', 'N', 'S', 'D':
 			// ignore
 		default:
-			errorf("unknown response for simple query: %q", t)
+			return Error(fmt.Errorf("unexpected messge %q from server", t))
 		}
 	}
 }
@@ -157,7 +185,10 @@ func (l *ListenerConn) listenerConnMain() {
 	// would panic; see comments near the beginning of that function.
 	l.lock.Lock()
 	close(l.senderToken)
-	l.err = err
+	if l.err == nil {
+		l.err = err
+	}
+	l.cn.Close()
 	l.lock.Unlock()
 
 	// There might be a query in-flight; make sure nobody's waiting for a
@@ -174,18 +205,31 @@ func quoteRelname(relname string) string {
 	return fmt.Sprintf(`"%s"`, strings.Replace(relname, `"`, `""`, -1))
 }
 
-func (l *ListenerConn) Listen(relname string) error {
+func (l *ListenerConn) TESTKillConnection() {
+	l.cn.Close()
+}
+func (l *ListenerConn) TESTRunAnyQuery(q string) (bool, error) {
 	if !l.acquireToken() {
-		return io.EOF
+		return false, io.EOF
+	}
+	defer l.releaseToken()
+
+	return l.execSimpleQuery(q)
+}
+
+
+func (l *ListenerConn) Listen(relname string) (bool, error) {
+	if !l.acquireToken() {
+		return false, io.EOF
 	}
 	defer l.releaseToken()
 
 	return l.execSimpleQuery("LISTEN " + quoteRelname(relname))
 }
 
-func (l *ListenerConn) Unlisten(relname string) error {
+func (l *ListenerConn) Unlisten(relname string) (bool, error) {
 	if !l.acquireToken() {
-		return io.EOF
+		return false, io.EOF
 	}
 	defer l.releaseToken()
 
@@ -195,9 +239,9 @@ func (l *ListenerConn) Unlisten(relname string) error {
 func (l *ListenerConn) sendSimpleQuery(q string) (err error) {
 	defer errRecover(&err)
 
-	// set queryInFlight *before* sending the packet to avoid race condition
-	if !atomic.CompareAndSwapInt32(&l.queryInFlight, 0, 1) {
-		panic("invalid queryInFlight")
+	// must set connection state before sending the query
+	if !l.setState(connStateExpectResponse) {
+		panic("two queries running at the same time")
 	}
 
 	data := writeBuf([]byte("Q\x00\x00\x00\x00"))
@@ -208,14 +252,18 @@ func (l *ListenerConn) sendSimpleQuery(q string) (err error) {
 	return nil
 }
 
-func (l *ListenerConn) execSimpleQuery(q string) error {
-	var done bool = false
-
+func (l *ListenerConn) execSimpleQuery(q string) (bool, error) {
 	err := l.sendSimpleQuery(q)
 	if err != nil {
 		// We can't know what state the protocol is in, so we need to abandon
 		// this connection.
-		goto fail
+		l.lock.Lock()
+		if l.err == nil {
+			l.err = err
+		}
+		l.cn.Close()
+		l.lock.Unlock()
+		return false, err
 	}
 
 	for {
@@ -223,34 +271,21 @@ func (l *ListenerConn) execSimpleQuery(q string) error {
 		if !ok {
 			// We lost the connection to server, don't bother waiting for a
 			// a response.
-			return io.EOF
+			return false, io.EOF
 		}
 		t, r := m.typ, m.buf
 		switch t {
 		case 'Z':
-			if !done {
-				err = fmt.Errorf("unexpected ReadyForQuery")
-				goto fail
-			}
 			// done
-			return err
+			return true, err
 		case 'E':
 			err = parseError(r)
-			fallthrough
 		case 'C':
-			if done {
-				err = fmt.Errorf("unexpected E/C")
-				goto fail
-			}
-			done = true
+			// query succeeded, nothing to do
 		default:
 			errorf("unknown response for simple query: %q", t)
 		}
 	}
-
-fail:
-	l.cn.Close()
-	return err
 }
 
 func (l *ListenerConn) Close() error {
@@ -306,19 +341,21 @@ func (l *Listener) Listen(relname string) error {
 	}
 
 	if l.cn != nil {
-		err := l.cn.Listen(relname)
-		if err != nil {
-			// XXX we should only fail on a PGError here
+		// XXX this deserves a comment
+		gotResponse, err := l.cn.Listen(relname)
+		if gotResponse && err != nil {
 			return err
 		}
+		l.channels[relname] = true
+		return nil
+	} else {
+		// add us to the list of channels and wait for a resync
+		l.channels[relname] = true
+		for l.cn == nil {
+			l.reconnectCond.Wait()
+		}
+		return nil
 	}
-
-	// add us to the list of channels and wait for a resync
-	l.channels[relname] = true
-	for l.cn == nil {
-		l.reconnectCond.Wait()
-	}
-	return nil
 }
 
 func (l *Listener) Unlisten(relname string) error {
@@ -330,13 +367,13 @@ func (l *Listener) Unlisten(relname string) error {
 		return fmt.Errorf("channel no")
 	}
 
-	delete(l.channels, relname)
 	if l.cn != nil {
-		// what do on failure here? I think the interface should
-		// specify that the caller should not retry on error
-		return l.cn.Unlisten(relname)
+		gotResponse, err := l.cn.Unlisten(relname)
+		if gotResponse && err != nil {
+			return err
+		}
 	}
-
+	delete(l.channels, relname)
 	return nil
 }
 
@@ -352,7 +389,7 @@ func (l *Listener) resync(cn *ListenerConn, notificationChan <-chan Notification
 	doneChan := make(chan error)
 	go func() {
 		for relname := range l.channels {
-			err := cn.Listen(relname)
+			_, err := cn.Listen(relname)
 			if err != nil {
 				doneChan <- err
 				return

@@ -54,22 +54,49 @@ See http://golang.org/pkg/database/sql to learn how to use with `pq` through the
 ## Listening for notifications
 
 PostgreSQL supports a simple publish/subscribe model over the database
-connections. See http://www.postgresql.org/docs/9.1/static/sql-notify.html for more information.
+connections.  See http://www.postgresql.org/docs/current/static/sql-notify.html
+for more information about the general mechanism.
 
-pq supports this using an infinite `Rows` object. When issuing a
-`Query("LISTEN <channel>")`, the query is sent to the server, and
-a special `Rows` object is returned. It always has the columns
+To start listening for notifications, you have to open a new dedicated
+connection to the database using NewListener().  Its sole argument is a
+conninfo string used for the connection (see above).  The return value is a
+pointer to an instance of a Listener struct, which supports three functions:
 
-* `bePid int` - The backend process ID
-* `relname string` - The channel name
-* `payload string` - The payload given to `NOTIFY`, or empty.
+* Listen(relname string) - Sends a LISTEN query to the server to start
+  listening for notification for the channel specified in relname.  Calls to
+  this function will block until an acknowledgement has been received from the
+  server.  Note that this may include time taken to re-establish the connection
+  if there is no active connection to the server.  Calling Listen on a channel
+  which has already been opened will return the error ErrChannelAlreadyOpen.
+* Unlisten(relname string) - Sends an UNLISTEN query to the server.  If there
+  is no active connection, this function will return immediately.  If the
+  channel specified by relname is not open, this function will return
+  ErrChannelNotOpen.
+* Close() - Closes the connection.
 
-When the statement object is closed, an implicit `UNLISTEN` is sent
-to the server.
+The relname in both Listen and Unlisten is case sensitive, and can contain any
+characters legal in an identifier (see
+http://www.postgresql.org/docs/current/static/sql-syntax-lexical.html#SQL-SYNTAX-IDENTIFIERS
+for more information).  Note that the identifier will be truncated to 63 bytes
+by the PostgreSQL server.
 
-The `Next()` method of the returned `Rows` will never reach EOF,
-except if the connection is terminated. Note that while `Next()`
-is being called, there is no way of interrupting the call.
+After a successful call to Listen, notifications can be received from the
+Listener.Notify channel.  The returned Notification structure looks as follows:
+
+type Notification struct {
+    BePid   int
+    RelName string
+    Extra   string
+}
+
+BePid is the Process ID (PID) of the notifying PostgreSQL server backend.
+RelName is the name of the channel.  Extra is a special payload string which
+can be emitted along with the notification.  If a payload is not supplied,
+Extra will be set to the empty string.
+
+There is also a lower level ListenerConn interface available which gives you
+more control over the handling of disconnects, but it is undocumented and its
+use is discouraged.
 
 ## Tests
 
@@ -99,7 +126,6 @@ Optionally, a benchmark suite can be run as part of the tests:
 
 ## Future / Things you can help with
 
-* Notifications: Allow listening on multiple channels at once
 * `hstore` sugar (i.e. handling hstore in `rows.Scan`)
 
 ## Thank you (alphabetical)

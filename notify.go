@@ -342,7 +342,7 @@ type Listener struct {
 	Notify chan Notification
 }
 
-func NewListener(name string) (*Listener, error) {
+func NewListener(name string) *Listener {
 	l := &Listener{
 		name: name,
 		lock: sync.Mutex{},
@@ -357,12 +357,16 @@ func NewListener(name string) (*Listener, error) {
 
 	go l.listenerMain()
 
-	return l, nil
+	return l
 }
 
 func (l *Listener) Listen(relname string) error {
 	l.lock.Lock()
 	defer l.lock.Unlock()
+
+	if l.isClosed {
+		return fmt.Errorf("attempted to operate on a closed listener")
+	}
 
 	// XXX the postgres server allows this; maybe we should, too?  on the other
 	// hand, this could be a reasonable sanity check and it's easy to check for
@@ -398,6 +402,10 @@ func (l *Listener) Listen(relname string) error {
 func (l *Listener) Unlisten(relname string) error {
 	l.lock.Lock()
 	defer l.lock.Unlock()
+
+	if l.isClosed {
+		return fmt.Errorf("attempted to operate on a closed listener")
+	}
 
 	_, exists := l.channels[relname]
 	if !exists {
@@ -513,14 +521,20 @@ func (l *Listener) connect() bool {
 	return true
 }
 
-func (l *Listener) Close() {
+func (l *Listener) Close() error {
 	l.lock.Lock()
 	defer l.lock.Unlock()
+
+	if l.isClosed {
+		return fmt.Errorf("attempted to operate on a closed listener")
+	}
 
 	if l.cn != nil {
 		l.cn.Close()
 	}
 	l.isClosed = true
+
+	return nil
 }
 
 func (l *Listener) listenerMain() {

@@ -59,8 +59,9 @@ for more information about the general mechanism.
 
 To start listening for notifications, you have to open a new dedicated
 connection to the database using NewListener().  Its sole argument is a
-conninfo string used for the connection (see above).  The return value is a
-pointer to an instance of a Listener struct, which supports three functions:
+conninfo string used for establishing the connection (see above).  The return
+value is a pointer to an instance of a Listener struct, which exports three
+functions:
 
 * Listen(relname string) - Sends a LISTEN query to the server to start
   listening for notification for the channel specified in relname.  Calls to

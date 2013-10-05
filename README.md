@@ -116,7 +116,7 @@ database connection.   The information contained in an event are:
         Error error
     }
 
-Error provides an error associated with the event (if any), any Event can be
+Error provides an error associated with the event (if any), and Event can be
 one of the following:
 
 * ListenerEventConnected - Emitted only when the database connection has been

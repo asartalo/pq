@@ -67,7 +67,7 @@ connection to the database using NewListener().  Its signature is:
 The first argument should be set to a connection string to be used to
 establish the database connection (see above).  minReconnectInterval controls
 the duration to wait before trying to re-establish the database connection
-after connection loss.  After each consecutive failure, this interval is
+after connection loss.  After each consecutive failure this interval is
 doubled, until maxReconnectInterval is reached.  A successful connection
 establishment procedure resets the interval back to minReconnectInterval.
 

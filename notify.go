@@ -221,26 +221,14 @@ func quoteRelname(relname string) string {
 	return fmt.Sprintf(`"%s"`, strings.Replace(relname, `"`, `""`, -1))
 }
 
-func (l *ListenerConn) TESTKillConnection() {
-	l.cn.Close()
-}
-func (l *ListenerConn) TESTRunAnyQuery(q string) (bool, error) {
-	if !l.acquireToken() {
-		return false, io.EOF
-	}
-	defer l.releaseToken()
-
-	return l.execSimpleQuery(q)
-}
-
 // Send a LISTEN query to the server.  See execSimpleQuery.
 func (l *ListenerConn) Listen(relname string) (bool, error) {
-	return l.execSimpleQuery("LISTEN " + quoteRelname(relname))
+	return l.ExecSimpleQuery("LISTEN " + quoteRelname(relname))
 }
 
 // Send an UNLISTEN query to the server.  See execSimpleQuery.
 func (l *ListenerConn) Unlisten(relname string) (bool, error) {
-	return l.execSimpleQuery("UNLISTEN " + quoteRelname(relname))
+	return l.ExecSimpleQuery("UNLISTEN " + quoteRelname(relname))
 }
 
 // Attempt to send a query on the connection.  Returns an error if sending the
@@ -268,7 +256,7 @@ func (l *ListenerConn) sendSimpleQuery(q string) (err error) {
 // be set to the error message we received from the server), or false if we did
 // not manage to execute the server on the query, in which case the connection
 // will be closed and all subsequently executed queries will return an error.
-func (l *ListenerConn) execSimpleQuery(q string) (bool, error) {
+func (l *ListenerConn) ExecSimpleQuery(q string) (bool, error) {
 	if !l.acquireToken() {
 		return false, io.EOF
 	}
@@ -320,6 +308,8 @@ func (l *ListenerConn) Err() error {
 	return l.err
 }
 
+var errClosed = errors.New("pq: Listener has been closed")
+
 var ErrChannelAlreadyOpen = errors.New("channel is already open")
 var ErrChannelNotOpen = errors.New("channel is not open")
 
@@ -333,7 +323,7 @@ const (
 
 type ListenerEvent struct {
 	Event ListenerEventType
-	Err error
+	Error error
 }
 
 type Listener struct {
@@ -360,6 +350,7 @@ func NewListener(name string) *Listener {
 		channels: make(map[string] bool),
 
 		Notify: make(chan Notification, 64),
+		Event: make(chan ListenerEvent, 8),
 	}
 	l.reconnectCond = sync.NewCond(&l.lock)
 
@@ -368,18 +359,23 @@ func NewListener(name string) *Listener {
 	return l
 }
 
+// Start listening for notifications on channel relname.  Only returns an error
+// if we're already listening on the channel, the query was executed on the
+// remote server but failed, or Close() has been called.
+//
+// Waits for the connection to be re-establisehed if called while the connection is down.
 func (l *Listener) Listen(relname string) error {
 	l.lock.Lock()
 	defer l.lock.Unlock()
 
 	if l.isClosed {
-		return fmt.Errorf("attempted to operate on a closed listener")
+		return errClosed
 	}
 
-	// XXX the postgres server allows this; maybe we should, too?  on the other
-	// hand, this could be a reasonable sanity check and it's easy to check for
-	// the exposed error message anyway if the caller doesn't know whether it's
-	// listening or not.
+	// The server allows you to issue a LISTEN on a channel which is already
+	// open, but it seems useful to be able to detect this case to spot for
+	// mistakes in application logic.  If the application genuinely does't
+	// care, it can check the exported error and ignore it.
 	_, exists := l.channels[relname]
 	if exists {
 		return ErrChannelAlreadyOpen
@@ -390,31 +386,38 @@ func (l *Listener) Listen(relname string) error {
 		// the remote server, but resulted in an error.  This should be
 		// relatively rare, so it's fine if we just pass the error to our
 		// caller.  However, if gotResponse is false, we could not complete the
-		// query on the remote server, and this connection is about to go away.
-		// We only have to add it to l.channels, and wait for resync() to take
-		// care of the rest.
+		// query on the remote server, and our underlying connection is about
+		// to go away, and we only have to add relname to l.channels, and wait
+		// for resync() to take care of the rest.
 		gotResponse, err := l.cn.Listen(relname)
 		if gotResponse && err != nil {
 			return err
 		}
-		l.channels[relname] = true
 	}
 
 	l.channels[relname] = true
 	for l.cn == nil {
 		l.reconnectCond.Wait()
+		// we let go of the mutex for a while
+		if l.isClosed {
+			return errClosed
+		}
 	}
+
 	return nil
 }
 
+// Stop listening on channel relname.
 func (l *Listener) Unlisten(relname string) error {
 	l.lock.Lock()
 	defer l.lock.Unlock()
 
 	if l.isClosed {
-		return fmt.Errorf("attempted to operate on a closed listener")
+		return errClosed
 	}
 
+	// Similarly to LISTEN, this is not an error in Postgres, but it seems
+	// useful to distinguish from the normal conditions.
 	_, exists := l.channels[relname]
 	if !exists {
 		return ErrChannelNotOpen
@@ -430,14 +433,26 @@ func (l *Listener) Unlisten(relname string) error {
 		}
 	}
 
-	// don't bother waiting for resync
+	// Don't bother waiting for resync if there's no connection.
 	delete(l.channels, relname)
 	return nil
 }
 
+// Clean up after losing the server connection.  Returns l.cn.Err(), which
+// should have the reason the connection was lost.
 func (l *Listener) disconnectCleanup() error {
 	l.lock.Lock()
 	defer l.lock.Unlock()
+
+	// sanity check; can't look at Err() until the channel has been closed
+	select {
+		case _, ok := <-l.connNotificationChan:
+			if !ok {
+				panic("connNotificationChan not closed")
+			}
+		default:
+			panic("connNotificationChan not closed")
+	}
 
 	err := l.cn.Err()
 	l.cn.Close()
@@ -445,6 +460,8 @@ func (l *Listener) disconnectCleanup() error {
 	return err
 }
 
+// Synchronize the list of channels we want to be listening on with the sserver
+// after the connection has been established.
 func (l *Listener) resync(cn *ListenerConn, notificationChan <-chan Notification) error {
 	doneChan := make(chan error)
 	go func() {
@@ -459,7 +476,7 @@ func (l *Listener) resync(cn *ListenerConn, notificationChan <-chan Notification
 
 			// If we couldn't reach the server, wait for notificationChan to
 			// close and then return the error message from the connection, as
-			// per ListenerConn's interface.  
+			// per ListenerConn's interface.
 			if err != nil {
 				for _ = range notificationChan {}
 				doneChan <- cn.Err()
@@ -511,6 +528,7 @@ func (l *Listener) connect() error {
 
 	err = l.resync(cn, notificationChan)
 	if err != nil {
+		cn.Close()
 		return err
 	}
 
@@ -526,7 +544,7 @@ func (l *Listener) Close() error {
 	defer l.lock.Unlock()
 
 	if l.isClosed {
-		return fmt.Errorf("attempted to operate on a closed listener")
+		return errClosed
 	}
 
 	if l.cn != nil {

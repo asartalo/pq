@@ -81,12 +81,13 @@ http://www.postgresql.org/docs/current/static/sql-syntax-lexical.html#SQL-SYNTAX
 for more information).  Note that the identifier will be truncated to 63 bytes
 by the PostgreSQL server.
 
-A call to Listen() will only fail in two cases:
+A call to Listen() will only fail in three cases:
 * The channel is already open.  The returned error will be
   ErrChannelAlreadyOpen.
 * The query was executed on the remote server, but PostgreSQL returned an error
   message.  The returned error will be a pq.Error containing the information
   the server supplied.
+* Close() has been called on the Listener.
 
 In all other cases Listener will make sure to deliver the command to the
 server, re-establishing the connection if necessary.
@@ -105,9 +106,44 @@ RelName is the name of the channel.  Extra is a special payload string which
 can be emitted along with the notification.  If a payload is not supplied,
 Extra will be set to the empty string.
 
+In addition to listening for notifications, any users of Listener should also
+handle `Events` from the Listener.  These events are emitted through the
+Listener.Event channel to offer information about the state of the underlying
+database connection.   The information contained in an event is:
+
+    type ListenerEvent struct {
+        Event ListenerEventType
+        Error error
+    }
+
+Error provides an error associated with the event (if any), any Event can be
+one of the following:
+
+* ListenerEventConnected - Emitted only when the database connection has been
+initially established.  Error will always be nil.  This event can be safely
+ignored.
+* ListenerEventDisconnect - Emitted after a database connection has been lost,
+either because of an error or because Close() has been called.  Error will be
+set to the reason the database connection was lost.  This event can be safely
+ignored.
+* ListenerEventReconnected - Emitted after a database connection has been
+established after losing it.  Error will always be nil.  It is *NOT* safe to
+ignore this event, see below.
+* ListenerEventConnectionAttemptFailed - Emitted after a connection to the
+database was attempted, but failed.  Error will be set to an error describing
+why the connection attempt did not succeed.  This event can be safely ignored.
+
+In the case of a connection failure, Listener will temporarily not be receiving
+any notifications from the server.  As Listener can't possibly know which
+notifications would have been sent by the server had the connection been alive,
+any users of Listener should treat ListenerEventReconnected as if it was a
+broadcast message notifying all channels the Listener is listening on.  Failure
+to do so might result in your program being unresponsive for longer periods of
+time.
+
 There is also a lower level ListenerConn interface available which gives you
-more control over the handling of disconnects, but it is undocumented and its
-use is discouraged.
+more control over the underlying database connection, but its use is
+discouraged, and the interface is undocumented.
 
 ## Tests
 

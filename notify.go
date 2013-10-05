@@ -449,12 +449,20 @@ func (l *Listener) resync(cn *ListenerConn, notificationChan <-chan Notification
 	doneChan := make(chan error)
 	go func() {
 		for relname := range l.channels {
+			// If we got a response, return that error to our caller as it's
+			// going to be more descriptive than cn.Err().
 			gotResponse, err := cn.Listen(relname)
 			if gotResponse && err != nil {
 				doneChan <- err
 				return
-			} else if err != nil {
-				close(doneChan)
+			}
+
+			// If we couldn't reach the server, wait for notificationChan to
+			// close and then return the error message from the connection, as
+			// per ListenerConn's interface.  
+			if err != nil {
+				for _ = range notificationChan {}
+				doneChan <- cn.Err()
 				return
 			}
 		}
@@ -462,9 +470,9 @@ func (l *Listener) resync(cn *ListenerConn, notificationChan <-chan Notification
 	}()
 
 	for {
-		// Ignore notifications while the synchronization is going on to avoid
+		// Ignore notifications while synchronization is going on to avoid
 		// deadlocks.  We have to emit a Reconnect event anyway as we can't
-		// possibly know which notifications (if any) we lost while th
+		// possibly know which notifications (if any) we lost while the
 		// connection was down, so there's no reason to try and process these
 		// messages at all.
 		select {
@@ -473,13 +481,8 @@ func (l *Listener) resync(cn *ListenerConn, notificationChan <-chan Notification
 					notificationChan = nil
 				}
 
-			case err, ok := <-doneChan:
-				if ok && err != nil {
-					return err
-				} else if !ok || notificationChan == nil {
-					return cn.Err()
-				}
-				return nil
+			case err := <-doneChan:
+				return err
 		}
 	}
 }

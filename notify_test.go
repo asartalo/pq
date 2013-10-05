@@ -302,7 +302,7 @@ func TestListenerFailedQuery(t *testing.T) {
 }
 
 func TestListenerReconnect(t *testing.T) {
-	l := newTestListenerTimeout(t, time.Millisecond, time.Hour)
+	l := newTestListenerTimeout(t, 20 * time.Millisecond, time.Hour)
 	defer l.Close()
 
 	db := openTestConn(t)

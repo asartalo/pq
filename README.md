@@ -76,7 +76,7 @@ The return value is a pointer to an instance of a Listener struct, which
 exports three functions:
 
 * Listen(relname string) - Sends a LISTEN query to the server to start
-  listening for notification for the channel specified in relname.  Calls to
+  listening for notifications on the channel specified in relname.  Calls to
   this function will block until an acknowledgement has been received from the
   server.  Note that this may include time taken to re-establish the connection
   if there is no active connection to the server.  Calling Listen on a channel

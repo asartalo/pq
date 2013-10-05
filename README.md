@@ -58,7 +58,21 @@ connections.  See http://www.postgresql.org/docs/current/static/sql-notify.html
 for more information about the general mechanism.
 
 To start listening for notifications, you have to open a new dedicated
-connection to the database using NewListener().  Its sole argument is a
+connection to the database using NewListener().  Its signature is:
+
+    func NewListener(name string,
+                     minReconnectInterval time.Duration,
+                     maxReconnectInterval time.Duration) *Listener
+
+The first argument should be set to a connection string to be used to
+establish the database connection (see above).  minReconnectInterval controls
+the duration to wait before trying to re-establish the database connection
+after connection loss.  After each consecutive failure, this interval is
+doubled.  After reaching maxReconnectInterval, the interval is not increased.
+A successful connection establishment procedure resets the interval back to
+minReconnectInterval.
+
+* a connection string used for establishing the database connection
 conninfo string used for establishing the connection (see above).  The return
 value is a pointer to an instance of a Listener struct, which exports three
 functions:

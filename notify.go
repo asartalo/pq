@@ -106,11 +106,11 @@ func (l *ListenerConn) releaseToken() {
 	}
 
 	select {
-		case l.senderToken <- true:
+	case l.senderToken <- true:
 
-		// sanity check
-		default:
-			panic("senderToken channel full")
+	// sanity check
+	default:
+		panic("senderToken channel full")
 	}
 }
 
@@ -328,6 +328,8 @@ type ListenerEvent struct {
 
 type Listener struct {
 	name string
+	minReconnectInterval time.Duration
+	maxReconnectInterval time.Duration
 
 	lock sync.Mutex
 	isClosed bool
@@ -340,9 +342,12 @@ type Listener struct {
 	Event chan ListenerEvent
 }
 
-func NewListener(name string) *Listener {
+func NewListener(name string, minReconnectInterval time.Duration, maxReconnectInterval time.Duration) *Listener {
 	l := &Listener{
 		name: name,
+		minReconnectInterval: minReconnectInterval,
+		maxReconnectInterval: maxReconnectInterval,
+
 		lock: sync.Mutex{},
 		isClosed: false,
 		cn: nil,
@@ -446,12 +451,12 @@ func (l *Listener) disconnectCleanup() error {
 
 	// sanity check; can't look at Err() until the channel has been closed
 	select {
-		case _, ok := <-l.connNotificationChan:
-			if !ok {
-				panic("connNotificationChan not closed")
-			}
-		default:
+	case _, ok := <-l.connNotificationChan:
+		if ok {
 			panic("connNotificationChan not closed")
+		}
+	default:
+		panic("connNotificationChan not closed")
 	}
 
 	err := l.cn.Err()
@@ -493,13 +498,13 @@ func (l *Listener) resync(cn *ListenerConn, notificationChan <-chan Notification
 		// connection was down, so there's no reason to try and process these
 		// messages at all.
 		select {
-			case _, ok := <-notificationChan:
-				if !ok {
-					notificationChan = nil
-				}
+		case _, ok := <-notificationChan:
+			if !ok {
+				notificationChan = nil
+			}
 
-			case err := <-doneChan:
-				return err
+		case err := <-doneChan:
+			return err
 		}
 	}
 }
@@ -539,6 +544,8 @@ func (l *Listener) connect() error {
 	return nil
 }
 
+// Close the connection.  Returns errClosed if the connection has already been
+// closed.
 func (l *Listener) Close() error {
 	l.lock.Lock()
 	defer l.lock.Unlock()
@@ -563,6 +570,7 @@ func (l *Listener) emitEvent(event ListenerEventType, err error) {
 // for notifications and emit events.
 func (l *Listener) listenerConnLoop() {
 	var nextReconnect time.Time
+	var reconnectInterval time.Duration
 
 	for {
 		for {
@@ -575,14 +583,20 @@ func (l *Listener) listenerConnLoop() {
 				return
 			}
 			l.emitEvent(ListenerEventConnectionAttemptFailed, err)
-			time.Sleep(30 * time.Second)
+
+			time.Sleep(reconnectInterval)
+			reconnectInterval *= 2
+			if reconnectInterval > l.maxReconnectInterval {
+				reconnectInterval = l.maxReconnectInterval
+			}
 		}
 		if nextReconnect.IsZero() {
 			l.emitEvent(ListenerEventConnected, nil)
 		} else {
 			l.emitEvent(ListenerEventReconnected, nil)
 		}
-		nextReconnect = time.Now().Add(30 * time.Second)
+		reconnectInterval = l.minReconnectInterval
+		nextReconnect = time.Now().Add(reconnectInterval)
 
 		for {
 			notification, ok := <-l.connNotificationChan
@@ -598,6 +612,7 @@ func (l *Listener) listenerConnLoop() {
 			return
 		}
 		l.emitEvent(ListenerEventDisconnected, err)
+
 		time.Sleep(nextReconnect.Sub(time.Now()))
 	}
 }

@@ -72,10 +72,8 @@ doubled, until maxReconnectInterval is reached.  Successfully completing the
 connection establishment procedure resets the interval back to
 minReconnectInterval.
 
-* a connection string used for establishing the database connection
-conninfo string used for establishing the connection (see above).  The return
-value is a pointer to an instance of a Listener struct, which exports three
-functions:
+The return value is a pointer to an instance of a Listener struct, which
+exports three functions:
 
 * Listen(relname string) - Sends a LISTEN query to the server to start
   listening for notification for the channel specified in relname.  Calls to

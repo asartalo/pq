@@ -12,13 +12,6 @@ import (
 	"time"
 )
 
-var ErrChannelAlreadyOpen = errors.New("channel is already open")
-var ErrChannelNotOpen = errors.New("channel is not open")
-
-const ListenerPidOpen = -100
-const ListenerPidDisconnect = -101
-const ListenerPidReconnect = -102
-
 type Notification struct {
 	BePid   int
 	RelName string
@@ -327,7 +320,21 @@ func (l *ListenerConn) Err() error {
 	return l.err
 }
 
+var ErrChannelAlreadyOpen = errors.New("channel is already open")
+var ErrChannelNotOpen = errors.New("channel is not open")
 
+type ListenerEventType int
+const (
+	ListenerEventConnected ListenerEventType = iota
+	ListenerEventDisconnected
+	ListenerEventReconnected
+	ListenerEventConnectionAttemptFailed
+)
+
+type ListenerEvent struct {
+	Event ListenerEventType
+	Err error
+}
 
 type Listener struct {
 	name string
@@ -340,6 +347,7 @@ type Listener struct {
 	channels map[string] bool
 
 	Notify chan Notification
+	Event chan ListenerEvent
 }
 
 func NewListener(name string) *Listener {
@@ -427,30 +435,38 @@ func (l *Listener) Unlisten(relname string) error {
 	return nil
 }
 
-func (l *Listener) disconnectCleanup() {
+func (l *Listener) disconnectCleanup() error {
 	l.lock.Lock()
 	defer l.lock.Unlock()
 
+	err := l.cn.Err()
 	l.cn.Close()
 	l.cn = nil
+	return err
 }
 
 func (l *Listener) resync(cn *ListenerConn, notificationChan <-chan Notification) error {
 	doneChan := make(chan error)
 	go func() {
 		for relname := range l.channels {
-			_, err := cn.Listen(relname)
-			if err != nil {
+			gotResponse, err := cn.Listen(relname)
+			if gotResponse && err != nil {
 				doneChan <- err
+				return
+			} else if err != nil {
+				close(doneChan)
 				return
 			}
 		}
-		close(doneChan)
+		doneChan <- nil
 	}()
 
 	for {
 		// Ignore notifications while the synchronization is going on to avoid
-		// deadlocks; we'll send a Reconnect after the synchronization is done.
+		// deadlocks.  We have to emit a Reconnect event anyway as we can't
+		// possibly know which notifications (if any) we lost while th
+		// connection was down, so there's no reason to try and process these
+		// messages at all.
 		select {
 			case _, ok := <-notificationChan:
 				if !ok {
@@ -458,10 +474,12 @@ func (l *Listener) resync(cn *ListenerConn, notificationChan <-chan Notification
 				}
 
 			case err, ok := <-doneChan:
-				if ok {
-					return nil
+				if ok && err != nil {
+					return err
+				} else if !ok || notificationChan == nil {
+					return cn.Err()
 				}
-				return err
+				return nil
 		}
 	}
 }
@@ -474,51 +492,30 @@ func (l *Listener) closed() bool {
 	return l.isClosed
 }
 
-func (l *Listener) connect() bool {
+func (l *Listener) connect() error {
 	var notificationChan chan Notification
 	var cn *ListenerConn
 	var err error
 
-	for {
-		notificationChan = make(chan Notification, 32)
-		for {
-			if l.closed() {
-				return false
-			}
+	notificationChan = make(chan Notification, 32)
+	cn, err = NewListenerConn(l.name, notificationChan)
+	if err != nil {
+		return err
+	}
 
-			cn, err = NewListenerConn(l.name, notificationChan)
-			if err == nil {
-				break
-			}
+	l.lock.Lock()
+	defer l.lock.Unlock()
 
-			// XXX
-			time.Sleep(1 * time.Second)
-		}
-
-		l.lock.Lock()
-		if l.resync(cn, notificationChan) == nil {
-			break
-		}
-
-		if l.closed() {
-			return false
-		}
-
-		// resync failed; retry the connection procedure from the beginning
-		l.lock.Unlock()
-
-		// XXX
-		time.Sleep(1 * time.Second)
+	err = l.resync(cn, notificationChan)
+	if err != nil {
+		return err
 	}
 
 	l.cn = cn
 	l.connNotificationChan = notificationChan
 	l.reconnectCond.Broadcast()
-	l.lock.Unlock()
 
-	l.Notify <- Notification{BePid: ListenerPidReconnect}
-
-	return true
+	return nil
 }
 
 func (l *Listener) Close() error {
@@ -537,11 +534,32 @@ func (l *Listener) Close() error {
 	return nil
 }
 
+func (l *Listener) emitEvent(event ListenerEventType, err error) {
+	l.Event <- ListenerEvent{event, err}
+}
+
 func (l *Listener) listenerMain() {
+	var nextReconnect time.Time
+
 	for {
-		if !l.connect() {
-			return
+		for {
+			err := l.connect()
+			if err == nil {
+				break
+			}
+
+			if l.closed() {
+				return
+			}
+			l.emitEvent(ListenerEventConnectionAttemptFailed, err)
+			time.Sleep(30 * time.Second)
 		}
+		if nextReconnect.IsZero() {
+			l.emitEvent(ListenerEventConnected, nil)
+		} else {
+			l.emitEvent(ListenerEventReconnected, nil)
+		}
+		nextReconnect = time.Now().Add(30 * time.Second)
 
 		for {
 			notification, ok := <-l.connNotificationChan
@@ -551,13 +569,13 @@ func (l *Listener) listenerMain() {
 			}
 			l.Notify <- notification
 		}
-		l.disconnectCleanup()
 
-		l.Notify <- Notification{BePid: ListenerPidDisconnect}
-
+		err := l.disconnectCleanup()
 		if l.closed() {
 			return
 		}
+		l.emitEvent(ListenerEventDisconnected, err)
+		time.Sleep(nextReconnect.Sub(time.Now()))
 	}
 }
 

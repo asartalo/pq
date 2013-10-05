@@ -41,8 +41,8 @@ func TestConnListen(t *testing.T) {
 	db := openTestConn(t)
 	defer db.Close()
 
-	err := l.Listen("notify_test")
-	if err != nil {
+	ok, err := l.Listen("notify_test")
+	if !ok || err != nil {
 		t.Fatal(err)
 	}
 
@@ -66,12 +66,15 @@ func TestConnUnlisten(t *testing.T) {
 	db := openTestConn(t)
 	defer db.Close()
 
-	err := l.Listen("notify_test")
-	if err != nil {
+	ok, err := l.Listen("notify_test")
+	if !ok || err != nil {
 		t.Fatal(err)
 	}
 
-	l.Unlisten("notify_test")
+	ok, err = l.Unlisten("notify_test")
+	if !ok || err != nil {
+		t.Fatal(err)
+	}
 
 	_, err = db.Exec("NOTIFY notify_test")
 	if err != nil {
@@ -93,8 +96,8 @@ func TestNotifyExtra(t *testing.T) {
 	db := openTestConn(t)
 	defer db.Close()
 
-	err := l.Listen("notify_test")
-	if err != nil {
+	ok, err := l.Listen("notify_test")
+	if !ok || err != nil {
 		t.Fatal(err)
 	}
 
@@ -121,12 +124,7 @@ func newTestListener(t *testing.T) (*Listener) {
 		os.Setenv("PGSSLMODE", "disable")
 	}
 
-	l, err := NewListener("")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	return l
+	return NewListener("")
 }
 
 

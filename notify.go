@@ -559,7 +559,9 @@ func (l *Listener) emitEvent(event ListenerEventType, err error) {
 	l.Event <- ListenerEvent{event, err}
 }
 
-func (l *Listener) listenerMain() {
+// Main logic here: maintain a connection to the server when possible, wait
+// for notifications and emit events.
+func (l *Listener) listenerConnLoop() {
 	var nextReconnect time.Time
 
 	for {
@@ -600,3 +602,8 @@ func (l *Listener) listenerMain() {
 	}
 }
 
+func (l *Listener) listenerMain() {
+	l.listenerConnLoop()
+	close(l.Notify)
+	close(l.Event)
+}

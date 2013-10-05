@@ -79,7 +79,8 @@ exports three functions:
   listening for notifications on the channel specified in relname.  Calls to
   this function will block until an acknowledgement has been received from the
   server.  Note that this may include time taken to re-establish the connection
-  if there is no active connection to the server.  Calling Listen on a channel
+  if there is no active connection to the server or the connection is lost
+  while attempting to communicate with the server.  Calling Listen on a channel
   which has already been opened will return the error ErrChannelAlreadyOpen.
 * Unlisten(relname string) - Sends an UNLISTEN query to the server.  If there
   is no active connection, this function will return immediately.  If the

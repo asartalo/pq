@@ -109,7 +109,7 @@ Extra will be set to the empty string.
 In addition to listening for notifications, any users of Listener should also
 handle `Events` from the Listener.  These events are emitted through the
 Listener.Event channel to offer information about the state of the underlying
-database connection.   The information contained in an event is:
+database connection.   The information contained in an event are:
 
     type ListenerEvent struct {
         Event ListenerEventType

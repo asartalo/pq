@@ -466,7 +466,7 @@ func (cn *conn) simpleQuery(q string) (res driver.Rows, err error) {
 			if err != nil {
 				errorf("unexpected CommandComplete in simple query execution")
 			}
-			res = &rows{st: st, done: true, rb: &readBuf{}}
+			res = &rows{st: st, done: true}
 		case 'Z':
 			cn.processReadyForQuery(r)
 			// done
@@ -485,7 +485,7 @@ func (cn *conn) simpleQuery(q string) (res driver.Rows, err error) {
 			if res != nil {
 				errorf("unexpected RowDescription in simple query execution")
 			}
-			res = &rows{st: st, rb: &readBuf{}}
+			res = &rows{st: st}
 			st.cols, st.rowTyps = parseMeta(r)
 			// To work around a bug in QueryRow in Go 1.2 and earlier, wait
 			// until the first DataRow has been received.
@@ -582,7 +582,7 @@ func (cn *conn) Query(query string, args []driver.Value) (_ driver.Rows, err err
 	}
 
 	st.exec(args)
-	return &rows{st: st, rb: &readBuf{}}, nil
+	return &rows{st: st}, nil
 }
 
 // Implement the optional "Execer" interface for one-shot queries
@@ -891,7 +891,7 @@ func (st *stmt) Close() (err error) {
 func (st *stmt) Query(v []driver.Value) (r driver.Rows, err error) {
 	defer errRecover(&err)
 	st.exec(v)
-	return &rows{st: st, rb: &readBuf{}}, nil
+	return &rows{st: st}, nil
 }
 
 func (st *stmt) Exec(v []driver.Value) (res driver.Result, err error) {
@@ -1060,7 +1060,7 @@ func parseComplete(commandTag string) (driver.Result, string) {
 type rows struct {
 	st   *stmt
 	done bool
-	rb   *readBuf
+	rb   readBuf
 }
 
 func (rs *rows) Close() error {
@@ -1094,14 +1094,14 @@ func (rs *rows) Next(dest []driver.Value) (err error) {
 
 	conn := rs.st.cn
 	for {
-		t := conn.recv1Buf(rs.rb)
+		t := conn.recv1Buf(&rs.rb)
 		switch t {
 		case 'E':
-			err = parseError(rs.rb)
+			err = parseError(&rs.rb)
 		case 'C':
 			continue
 		case 'Z':
-			conn.processReadyForQuery(rs.rb)
+			conn.processReadyForQuery(&rs.rb)
 			rs.done = true
 			if err != nil {
 				return err
